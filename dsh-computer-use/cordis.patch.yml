@@ -1,0 +1,4 @@
+# dsh-computer-use bundle patch: mounts the host half.
+- insert:
+    - id: computer-use
+      name: dsh-computer-use
