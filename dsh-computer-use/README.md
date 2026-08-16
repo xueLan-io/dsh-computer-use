@@ -20,7 +20,7 @@ Windows 窗口 / 鼠标 / 键盘
 - `computer_get_window_state`：截图（保存为 DSH 附件）+ 可访问性 UI 树
 - `computer_activate_window`：激活窗口
 - `computer_click`：按元素索引或窗口坐标点击
-- `computer_type_text`：输入文本（支持中文，剪贴板粘贴）
+- `computer_type_text`：输入文本（SendInput Unicode 事件，绕过输入法，中文直接输入；自动先激活目标窗口）
 - `computer_press_key`：发送组合键（如 `Control_L+a`、`Control_L+Shift_L+Tab`、`Return`、`F5`、`F1`-`F24`；多修饰键组合精确按下/释放）
 - `computer_scroll`：滚动
 - `computer_drag`：拖动
@@ -95,7 +95,7 @@ computer-use:
 - 禁止发送 Windows/Meta 键
 - 工具描述中不建议操作终端、密码框、安全设置和锁屏
 - 截图使用 `mss` 截取窗口矩形，被完全遮挡的窗口可能截不到
-- **硬性安全限制（不可关闭）**：禁止对 DSH 聊天窗口（DeepSeek Harness）进行点击/输入/按键/滚动/拖动，防止覆盖正在进行的对话；识别基于窗口标题/类名启发式 + 已识别句柄记忆（一次命中后该窗口永久拦截），浏览器窗口只有标题含 dsh/harness/deepseek 关键词时才会被拦，请勿把 DSH 页签切到无关标题的页面上；启动浏览器时插件自动强制 `--new-window`，保证新开窗口
+- **硬性安全限制（不可关闭）**：禁止对 DSH 聊天窗口（DeepSeek Harness）进行点击/输入/按键/滚动/拖动，防止覆盖正在进行的对话；识别基于窗口标题/类名启发式 + 已识别句柄记忆（一次命中后该窗口永久拦截），浏览器窗口只有标题含 DSH 品牌关键词（DeepSeek / Harness / "dsh harness" 等精确品牌词，裸 "dsh" 子串不拦，避免误伤 dsh-* 项目名）时才会被拦；启动浏览器时插件自动强制 `--new-window`，保证新开窗口
 - 点击/滚动/拖动的坐标会校验在窗口矩形内，越界直接报错，不会点到其他窗口
 
 ## 开发
