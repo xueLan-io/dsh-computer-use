@@ -1,6 +1,6 @@
 # dsh-computer-use
 
-DSH 桌面控制插件：让 DSH Agent 像 Codex Computer Use 一样操作 Windows 桌面——列出窗口、截图、读取 UI Automation 元素树、模拟鼠标/键盘。
+DSH 桌面控制插件：让 DSH Agent 像 Codex Computer Use 一样操作 Windows 桌面。插件是 Node.js 原生运行时，不需要 Python、pip 或外部 sidecar。
 
 架构复刻自 Codex Computer Use：
 
@@ -8,21 +8,20 @@ DSH 桌面控制插件：让 DSH Agent 像 Codex Computer Use 一样操作 Windo
 DSH 模型
   ↓ 调用 computer_* 工具
 dsh-computer-use (Node/Cordis)
-  ↓ JSON-RPC over stdio
-python/computer_use_helper.py
-  ↓ UI Automation + SendInput + mss
-Windows 窗口 / 鼠标 / 键盘
+  ↓ Node native runtime
+dsh-computer-use-native + Win32/UI Automation
+  Windows 窗口 / 鼠标 / 键盘
 ```
 
 ## 功能
 
 - `computer_list_apps`：列出可操作的窗口
-- `computer_get_window_state`：截图（保存为 DSH 附件）+ 可访问性 UI 树
+- `computer_get_window_state`：截图（保存为 DSH 附件）+ 可选 Windows UI Automation 观察快照
 - `computer_activate_window`：激活窗口
-- `computer_click`：按元素索引或窗口坐标点击
-- `computer_type_text`：输入文本（SendInput Unicode 事件，绕过输入法，中文直接输入；自动先激活目标窗口）
-- `computer_press_key`：发送组合键（如 `Control_L+a`、`Control_L+Shift_L+Tab`、`Return`、`F5`、`F1`-`F24`；多修饰键组合精确按下/释放）
-- `computer_scroll`：滚动
+- `computer_click`：使用最新 observation 的窗口相对坐标点击
+- `computer_type_text`：向目标窗口输入文本（优先剪贴板粘贴，兼容忽略 Unicode 注入的控件；粘贴不可用时回退 Unicode 注入）
+- `computer_press_key`：发送不包含 Windows/Meta 键的组合键
+- `computer_scroll`：使用真实 Windows wheel input 滚动
 - `computer_drag`：拖动
 - `computer_launch_app`：启动应用
 - 控制指示 UI：控制期间屏幕四周显示蓝色高亮边框，顶部显示“DSH 正在控制你的电脑”小蓝条，鼠标指针切换为蓝色 DSH 光标（截图时会临时隐藏，避免干扰视觉模型）
@@ -31,20 +30,19 @@ Windows 窗口 / 鼠标 / 键盘
 ## 依赖
 
 - Windows 10/11
-- Python 3.10+（已测试 3.13）
-- Python 包：
+- Windows 10/11 x64
+- Node.js 22.19+
+- `dsh-computer-use-native` Windows x64 Node-API provider
 
-  ```bash
-  pip install uiautomation mss pillow
-  ```
+Native provider 提供 HWND 窗口枚举、截图、屏幕绝对坐标输入、真实 wheel input 和 Windows UI Automation。UIA 树有节点数和深度边界；截断时会标记 `uiaTruncated`，不会伪造完整树。
 
 ## 安装（DSH web profile）
 
-1. 把本目录放到 `~/.dsh/plugins/dsh-computer-use`。
-2. 在 `~/.dsh/profiles/web/package.json` 的 `dependencies` 加（把 `<用户名>` 换成你自己的 Windows 用户名）：
+1. 本仓库已经位于 `D:\DSH_WORKSPACE\plugins\dsh-computer-use-pr\dsh-computer-use`，不要复制到运行数据目录。
+2. 在 `D:\DSH_HOME\profiles\web\package.json` 的 `dependencies` 加：
 
    ```json
-   "dsh-computer-use": "link:C:/Users/<用户名>/.dsh/plugins/dsh-computer-use"
+   "dsh-computer-use": "link:D:/DSH_WORKSPACE/plugins/dsh-computer-use-pr/dsh-computer-use"
    ```
 
 3. 在同一个文件的 `dsh.profile.bundles` 加 `"dsh-computer-use"`。
@@ -56,16 +54,14 @@ Windows 窗口 / 鼠标 / 键盘
 
 5. 重启 DSH。
 
-> 本插件仅支持 Windows（依赖 UI Automation）。macOS / Linux 上会因缺少 Python 依赖而无法工作。
+> 本插件仅支持 Windows。安装插件依赖后即可运行，不需要安装 Python。
 
 ## 配置
 
 ```yaml
-# ~/.dsh/settings.yaml
+# D:\DSH_HOME\settings.yaml
 computer-use:
   enabled: true
-  pythonBin: python        # Python 解释器路径
-  timeoutMs: 120000
   requireApproval: true    # 高风险操作（点击/输入/启动）先征求用户同意
   skipApprovalWhenPolicyNever: true  # 会话策略为“不再询问”(never) 时跳过交互审批，仅由 allowControl 把关；
                                      # 设为 false 则遵循官方 fail-closed 语义（此类操作会被拒绝）
@@ -73,10 +69,8 @@ computer-use:
   overlayEnabled: true     # 控制时显示蓝色高亮 + 顶部提示 + 自定义鼠标
   overlayIdleMs: 10000     # 最后一次操作后多久自动隐藏指示
   overlayText: DSH 正在控制你的电脑
-  overlayColor: '#2563EB'  # 蓝色高亮色
+  overlayColor: '#00D9FF'  # 荧光蓝透明辉光边框
   allowControl: false      # 授权开关（默认关闭！气泡打勾后才允许控制）
-  permissionWidgetEnabled: false  # 旧的桌面悬浮窗默认关闭，改用 DSH 内嵌气泡；
-                                  # 若开启，悬浮窗勾选状态也会参与门禁（双通道都需放行）
 ```
 
 ## 配合视觉模型
@@ -84,9 +78,9 @@ computer-use:
 主模型（如 DeepSeek）不能看图时，让 Agent：
 
 1. `computer_list_apps` 选窗口
-2. `computer_get_window_state` 截图（返回图片附件和 `screenshotPath`）
+2. `computer_get_window_state` 截图和 UIA 快照（返回图片附件、`screenshotPath`、`observationId`）
 3. `vision_analyze`（来自 `dsh-vision-model`）传 `imagePath=screenshotPath` 分析截图
-4. 根据分析结果再调用 `computer_click` / `computer_type_text` 等
+4. 根据分析结果调用动作工具，并传入同一次观察返回的 `observationId`
 5. 每次动作后**必须**重新 `computer_get_window_state` 刷新（元素索引和坐标只对当次有效）
 
 ## 安全
@@ -94,8 +88,8 @@ computer-use:
 - 默认 `requireApproval: true`，点击、输入、启动等操作会请求用户确认
 - 禁止发送 Windows/Meta 键
 - 工具描述中不建议操作终端、密码框、安全设置和锁屏
-- 截图使用 `mss` 截取窗口矩形，被完全遮挡的窗口可能截不到
-- **硬性安全限制（不可关闭）**：禁止对 DSH 聊天窗口（DeepSeek Harness）进行点击/输入/按键/滚动/拖动，防止覆盖正在进行的对话；识别基于窗口标题/类名启发式 + 已识别句柄记忆（一次命中后该窗口永久拦截），浏览器窗口只有标题含 DSH 品牌关键词（DeepSeek / Harness / "dsh harness" 等精确品牌词，裸 "dsh" 子串不拦，避免误伤 dsh-* 项目名）时才会被拦；启动浏览器时插件自动强制 `--new-window`，保证新开窗口
+- **硬性安全限制（不可关闭）**：禁止对 DSH 聊天窗口进行点击/输入/按键/滚动/拖动，识别同时使用进程路径、类名、品牌标题和已识别句柄记忆
+- 所有动作必须传入未过期的 `observationId`；窗口身份、PID、进程路径或矩形变化都会要求重新观察
 - 点击/滚动/拖动的坐标会校验在窗口矩形内，越界直接报错，不会点到其他窗口
 
 ## 开发
@@ -104,6 +98,7 @@ computer-use:
 npm install
 npm run typecheck
 npm run build
+npm run test:native
 ```
 
 ## License

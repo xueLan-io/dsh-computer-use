@@ -7,17 +7,15 @@ import z from '@deepseek-ai/schemastery';
 export const ComputerUseConfigSchema = z.object({
     enabled: z.boolean().default(true),
     allowControl: z.boolean().default(false),
-    pythonBin: z.string().default('python'),
-    timeoutMs: z.number().default(120_000),
     requireApproval: z.boolean().default(true),
     skipApprovalWhenPolicyNever: z.boolean().default(true),
     screenshotDir: z.string().default('computer-use/screenshots'),
+    screenshotRetention: z.number().default(86_400_000),
     overlayEnabled: z.boolean().default(true),
     overlayIdleMs: z.number().default(10_000),
-    overlayText: z.string().default('DSH 正在控制你的电脑'),
-    overlayColor: z.string().default('#2563EB'),
-    permissionWidgetEnabled: z.boolean().default(false),
-    permissionFile: z.string().default('computer-use.permission.json'),
+    overlayText: z.string().default('DSH 正在操作电脑'),
+    /** Deprecated: color is fixed to the DSH brand blue in the native overlay; kept only for old config compatibility. */
+    overlayColor: z.string().default('#00D9FF'),
 });
 /** Namespace name. */
 export const COMPUTER_USE_NAMESPACE = 'computer-use';

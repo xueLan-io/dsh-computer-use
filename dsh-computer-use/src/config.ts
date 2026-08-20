@@ -11,10 +11,6 @@ export interface ComputerUseConfig {
   enabled: boolean
   /** User permission: whether DSH is allowed to control the computer. */
   allowControl: boolean
-  /** Path to the Python interpreter used to launch the sidecar. */
-  pythonBin: string
-  /** Per-request timeout for sidecar calls, in milliseconds. */
-  timeoutMs: number
   /** Whether high-risk actions need explicit user approval (default true). */
   requireApproval: boolean
   /**
@@ -23,37 +19,33 @@ export interface ComputerUseConfig {
    * 开启本项后改为"跳过询问、仅由 allowControl 开关把关"，适合自动化场景。
    */
   skipApprovalWhenPolicyNever: boolean
-  /** Root directory for screenshots; relative paths resolve under DSH home. */
+/** Root directory for screenshots; relative paths resolve under DSH home. */
   screenshotDir: string
-  /** Whether to show the blue highlight overlay + custom cursor while controlling. */
+  /** Screenshots older than this many milliseconds are pruned (0 disables). */
+  screenshotRetention: number
+  /** Whether to show the native control indicator while controlling. */
   overlayEnabled: boolean
   /** How long the overlay stays after the last action, in milliseconds. */
   overlayIdleMs: number
   /** Text shown in the top banner. */
   overlayText: string
-  /** Highlight color (hex). */
+  /** Deprecated: the native overlay color is fixed to the DSH brand blue; kept only for config compatibility. */
   overlayColor: string
-  /** Whether to show the small allow/deny widget beside the DSH chat window. */
-  permissionWidgetEnabled: boolean
-  /** JSON file that stores the allow/deny state (relative paths resolve under DSH home). */
-  permissionFile: string
 }
 
 /** Schemastery schema with defaults. */
 export const ComputerUseConfigSchema = z.object({
   enabled: z.boolean().default(true),
   allowControl: z.boolean().default(false),
-  pythonBin: z.string().default('python'),
-  timeoutMs: z.number().default(120_000),
   requireApproval: z.boolean().default(true),
   skipApprovalWhenPolicyNever: z.boolean().default(true),
   screenshotDir: z.string().default('computer-use/screenshots'),
+  screenshotRetention: z.number().default(86_400_000),
   overlayEnabled: z.boolean().default(true),
   overlayIdleMs: z.number().default(10_000),
-  overlayText: z.string().default('DSH 正在控制你的电脑'),
-  overlayColor: z.string().default('#2563EB'),
-  permissionWidgetEnabled: z.boolean().default(false),
-  permissionFile: z.string().default('computer-use.permission.json'),
+overlayText: z.string().default('DSH 正在操作电脑'),
+  /** Deprecated: color is fixed to the DSH brand blue in the native overlay; kept only for old config compatibility. */
+  overlayColor: z.string().default('#00D9FF'),
 }) as unknown as z<ComputerUseConfig>
 
 /** Namespace name. */

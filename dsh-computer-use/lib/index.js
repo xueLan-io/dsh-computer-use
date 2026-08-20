@@ -7,7 +7,7 @@
 import { settingsNamespace } from '@deepseek-ai/dsh-settings';
 import { COMPUTER_USE_NAMESPACE, ComputerUseConfigSchema } from "./config.js";
 import { registerComputerUseRpc } from "./rpc.js";
-import { defineActivateWindowTool, defineClickTool, defineDragTool, defineGetWindowStateTool, defineLaunchAppTool, defineListWindowsTool, definePressKeyTool, defineScrollTool, startPermissionWidget, defineTypeTextTool, disposeSidecar, } from "./tools.js";
+import { defineActivateWindowTool, defineClickTool, defineDragTool, defineGetWindowStateTool, defineLaunchAppTool, defineListWindowsTool, definePressKeyTool, defineScrollTool, defineTypeTextTool, disposeRuntime, } from "./tools.js";
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-computer-use';
 /** Services required by this plugin. */
@@ -17,9 +17,6 @@ export function apply(ctx) {
     const getConfig = () => scope.get();
     ctx.effect(() => registerComputerUseRpc(ctx, scope), 'dsh-computer-use: RPC channel');
     ctx.effect(() => {
-        const widgetTimer = setTimeout(() => {
-            void startPermissionWidget(getConfig);
-        }, 1500);
         const disposers = [
             ctx.tools.register(defineListWindowsTool({ ctx, getConfig })),
             ctx.tools.register(defineGetWindowStateTool({ ctx, getConfig })),
@@ -32,10 +29,9 @@ export function apply(ctx) {
             ctx.tools.register(defineLaunchAppTool({ ctx, getConfig })),
         ];
         return () => {
-            clearTimeout(widgetTimer);
             for (const dispose of disposers)
                 dispose();
-            disposeSidecar();
+            disposeRuntime();
         };
     }, 'dsh-computer-use: tool registrations');
 }

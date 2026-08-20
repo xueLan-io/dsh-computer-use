@@ -9,10 +9,6 @@ export interface ComputerUseConfig {
     enabled: boolean;
     /** User permission: whether DSH is allowed to control the computer. */
     allowControl: boolean;
-    /** Path to the Python interpreter used to launch the sidecar. */
-    pythonBin: string;
-    /** Per-request timeout for sidecar calls, in milliseconds. */
-    timeoutMs: number;
     /** Whether high-risk actions need explicit user approval (default true). */
     requireApproval: boolean;
     /**
@@ -23,18 +19,16 @@ export interface ComputerUseConfig {
     skipApprovalWhenPolicyNever: boolean;
     /** Root directory for screenshots; relative paths resolve under DSH home. */
     screenshotDir: string;
-    /** Whether to show the blue highlight overlay + custom cursor while controlling. */
+    /** Screenshots older than this many milliseconds are pruned (0 disables). */
+    screenshotRetention: number;
+    /** Whether to show the native control indicator while controlling. */
     overlayEnabled: boolean;
     /** How long the overlay stays after the last action, in milliseconds. */
     overlayIdleMs: number;
     /** Text shown in the top banner. */
     overlayText: string;
-    /** Highlight color (hex). */
+    /** Deprecated: the native overlay color is fixed to the DSH brand blue; kept only for config compatibility. */
     overlayColor: string;
-    /** Whether to show the small allow/deny widget beside the DSH chat window. */
-    permissionWidgetEnabled: boolean;
-    /** JSON file that stores the allow/deny state (relative paths resolve under DSH home). */
-    permissionFile: string;
 }
 /** Schemastery schema with defaults. */
 export declare const ComputerUseConfigSchema: z<ComputerUseConfig>;

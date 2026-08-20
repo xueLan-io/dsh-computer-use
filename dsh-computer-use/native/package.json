@@ -1,0 +1,20 @@
+{
+  "name": "dsh-computer-use-native",
+  "version": "0.1.0",
+  "description": "Windows Node-API provider for DSH Computer Use",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "files": ["index.mjs", "index.d.ts", "binding.gyp", "src", "build/Release/*.node"],
+  "scripts": {
+    "install": "node-gyp-build",
+    "prepack": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test:load": "node -e \"import('./index.mjs').then((m) => console.log(m.runtimeInfo()))\""
+  },
+  "engines": { "node": ">=22.19.0" },
+  "dependencies": { "node-addon-api": "^8.9.2", "node-gyp-build": "^4.8.4" },
+  "devDependencies": { "node-gyp": "^12.4.0" }
+}

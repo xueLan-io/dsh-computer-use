@@ -1,7 +1,7 @@
 {
   "name": "dsh-computer-use",
   "version": "0.1.0",
-  "description": "DSH Computer Use plugin: let the agent list Windows windows, capture screenshots, read UI Automation trees, and drive the desktop (mouse, keyboard, scroll, drag) through a small Python sidecar.",
+  "description": "DSH Computer Use plugin: native Node.js Windows desktop automation without Python.",
   "license": "BSD-3-Clause",
   "type": "module",
   "main": "lib/index.js",
@@ -35,8 +35,10 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json && node scripts/sync-client.mjs",
+    "build:client": "node scripts/sync-client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:native": "npm --prefix native run test:load"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -44,15 +46,15 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0-rc.7",
     "@deepseek-ai/dsh-attachment": "^0.0.1",
+    "@deepseek-ai/dsh-client-connection": "^0.0.1",
+    "@deepseek-ai/dsh-client-runtime": "^0.0.1",
     "@deepseek-ai/dsh-credentials": "^0.0.1",
+    "@deepseek-ai/dsh-host-apiproxy": "^0.0.1",
     "@deepseek-ai/dsh-llm": "^0.0.1",
     "@deepseek-ai/dsh-settings": "^0.0.1",
     "@deepseek-ai/dsh-tools": "^0.0.1",
     "@deepseek-ai/dsh-user-approval": "^0.0.1",
-    "@deepseek-ai/schemastery": "^0.0.1",
-    "@deepseek-ai/dsh-client-connection": "^0.0.1",
-    "@deepseek-ai/dsh-client-runtime": "^0.0.1",
-    "@deepseek-ai/dsh-host-apiproxy": "^0.0.1"
+    "@deepseek-ai/schemastery": "^0.0.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -95,11 +97,20 @@
   },
   "files": [
     "lib",
-    "python",
+    "client",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
+    "native/index.mjs",
+    "native/index.d.ts",
+    "native/package.json",
+    "native/binding.gyp",
+    "native/src",
+    "native/build/Release/*.node",
     "lib/client.js",
     "lib/client.d.ts"
-  ]
+  ],
+  "dependencies": {
+    "dsh-computer-use-native": "file:native"
+  }
 }

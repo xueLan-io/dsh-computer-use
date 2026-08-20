@@ -18,9 +18,8 @@ import {
   defineListWindowsTool,
   definePressKeyTool,
   defineScrollTool,
-  startPermissionWidget,
   defineTypeTextTool,
-  disposeSidecar,
+  disposeRuntime,
 } from './tools.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -40,9 +39,6 @@ export function apply(ctx: Context): void {
   ctx.effect(() => registerComputerUseRpc(ctx, scope), 'dsh-computer-use: RPC channel')
 
   ctx.effect(() => {
-    const widgetTimer = setTimeout(() => {
-      void startPermissionWidget(getConfig)
-    }, 1500)
     const disposers = [
       ctx.tools.register(defineListWindowsTool({ ctx, getConfig })),
       ctx.tools.register(defineGetWindowStateTool({ ctx, getConfig })),
@@ -55,9 +51,8 @@ export function apply(ctx: Context): void {
       ctx.tools.register(defineLaunchAppTool({ ctx, getConfig })),
     ]
     return () => {
-      clearTimeout(widgetTimer)
       for (const dispose of disposers) dispose()
-      disposeSidecar()
+      disposeRuntime()
     }
   }, 'dsh-computer-use: tool registrations')
 }
