@@ -2,6 +2,18 @@
 
 DSH 桌面控制插件：让 DSH Agent 像 Codex Computer Use 一样操作 Windows 桌面。插件是 Node.js 原生运行时，不需要 Python、pip 或外部 sidecar。
 
+> ⚠️ **【重要说明与潜在隐患 / 注意事项】**
+>
+> 1. **C++ 编译与环境依赖**：
+>    - 本项目使用 Node-API（C++）直接调用 Win32 / UI Automation API，**完全移除了 Python 及 pip 依赖**。
+>    - 在未提供预编译二进制（Prebuild）的情况下，首次 `npm install` 或编译需要本地具备 **Windows C++ 生成工具链**（如 Visual Studio Build Tools / MSVC 及 `node-gyp`）。若未安装 C++ 编译环境，安装过程可能提示构建失败。
+> 2. **系统平台与架构限制**：
+>    - 插件依赖 Win32 原生消息、GDI+ 及 Windows UI Automation，**仅支持 Windows 10/11 x64** 操作系统，不支持 macOS / Linux。
+> 3. **安全与授权防护机制**：
+>    - **授权门禁**：默认 `allowControl: false`，必须在 DSH 输入框上方界面显式勾选授权气泡后，Agent 才有权控制桌面。
+>    - **DSH 自身防误触保护**：内置硬性安全拦截机制，禁止 Agent 对 DSH 自身的聊天和控制窗口进行点击/输入/按键，防止对话中断。
+>    - **Observation 时效与熔断**：所有桌面动作均严格绑定 `observationId`（3分钟有效期）。当窗口发生位移、尺寸突变或目标窗口失去焦点时会自动熔断并拒绝操作，要求 Agent 重新观察，防止误操作漂移窗口。
+
 架构复刻自 Codex Computer Use：
 
 ```
@@ -38,15 +50,15 @@ Native provider 提供 HWND 窗口枚举、截图、屏幕绝对坐标输入、�
 
 ## 安装（DSH web profile）
 
-1. 本仓库已经位于 `D:\DSH_WORKSPACE\plugins\dsh-computer-use-pr\dsh-computer-use`，不要复制到运行数据目录。
-2. 在 `D:\DSH_HOME\profiles\web\package.json` 的 `dependencies` 加：
+1. 把本插件仓库克隆或链接到本地插件目录（例如 `~/.dsh/plugins/dsh-computer-use`）。
+2. 在 DSH profile 的 `package.json`（例如 `~/.dsh/profiles/web/package.json`）的 `dependencies` 中添加：
 
    ```json
-   "dsh-computer-use": "link:D:/DSH_WORKSPACE/plugins/dsh-computer-use-pr/dsh-computer-use"
+   "dsh-computer-use": "link:C:/Users/<用户名>/.dsh/plugins/dsh-computer-use"
    ```
 
-3. 在同一个文件的 `dsh.profile.bundles` 加 `"dsh-computer-use"`。
-4. 在 `~/.dsh/profiles/web` 执行：
+3. 在同一个文件的 `dsh.profile.bundles` 中添加 `"dsh-computer-use"`。
+4. 在 `~/.dsh/profiles/web` 目录下执行插件安装与构建：
 
    ```bash
    dsh plugin --profile web install
@@ -59,7 +71,7 @@ Native provider 提供 HWND 窗口枚举、截图、屏幕绝对坐标输入、�
 ## 配置
 
 ```yaml
-# D:\DSH_HOME\settings.yaml
+# ~/.dsh/settings.yaml (或 DSH 配置目录下的 settings.yaml)
 computer-use:
   enabled: true
   requireApproval: true    # 高风险操作（点击/输入/启动）先征求用户同意
