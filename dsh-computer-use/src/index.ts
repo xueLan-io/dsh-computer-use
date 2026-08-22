@@ -9,6 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { COMPUTER_USE_NAMESPACE, ComputerUseConfigSchema, type ComputerUseConfig } from './config.ts'
 import { registerComputerUseRpc } from './rpc.ts'
+import { initRuntime } from './runtime.ts'
 import {
   defineActivateWindowTool,
   defineClickTool,
@@ -39,6 +40,9 @@ export function apply(ctx: Context): void {
   ctx.effect(() => registerComputerUseRpc(ctx, scope), 'dsh-computer-use: RPC channel')
 
   ctx.effect(() => {
+    // Wire the production runtime: it constructs the guarded provider
+    // (createProvider + guardProvider) that every tool call goes through.
+    initRuntime({ ctx, getConfig })
     const disposers = [
       ctx.tools.register(defineListWindowsTool({ ctx, getConfig })),
       ctx.tools.register(defineGetWindowStateTool({ ctx, getConfig })),

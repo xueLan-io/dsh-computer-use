@@ -1,0 +1,7 @@
+{
+  "name": "dsh-computer-use-macos",
+  "version": "0.1.0",
+  "description": "macOS provider package for dsh-computer-use (placeholder).",
+  "type": "module",
+  "os": ["darwin"]
+}

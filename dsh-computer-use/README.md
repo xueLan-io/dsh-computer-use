@@ -13,6 +13,13 @@ dsh-computer-use-native + Win32/UI Automation
   Windows 窗口 / 鼠标 / 键盘
 ```
 
+## 平台支持状态
+
+> **当前仅 Windows 10/11 x64 是可发布平台。**
+> macOS 与 Linux 的 `DesktopProvider`、原生 helper/addon 属于**未发布草案**
+> （见 `docs/CROSS_PLATFORM_PLAN.md` 阶段 3-5），尚未在目标平台编译/运行验证，
+> 也没有对应的可安装发布包。不要在生产环境中把 macOS/Linux 视为“已支持”。
+
 ## 功能
 
 - `computer_list_apps`：列出可操作的窗口

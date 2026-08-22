@@ -1,0 +1,7 @@
+{
+  "name": "dsh-computer-use-linux-native",
+  "version": "0.1.0",
+  "description": "Native Linux helper provider for dsh-computer-use (placeholder).",
+  "type": "module",
+  "os": ["linux"]
+}

@@ -4,6 +4,8 @@
   "description": "DSH Computer Use plugin: native Node.js Windows desktop automation without Python.",
   "license": "BSD-3-Clause",
   "type": "module",
+  "os": ["win32"],
+  "cpu": ["x64"],
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
@@ -38,6 +40,8 @@
     "build": "tsc -p tsconfig.json && node scripts/sync-client.mjs",
     "build:client": "node scripts/sync-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:contract": "node --experimental-strip-types --test tests/contracts/*.test.ts",
+    "test": "npm run test:contract",
     "test:native": "npm --prefix native run test:load"
   },
   "engines": {
@@ -97,6 +101,9 @@
   },
   "files": [
     "lib",
+    "!lib/providers/**",
+    "!lib/types/providers/**",
+    "!packages/**",
     "client",
     "cordis.patch.yml",
     "README.md",

@@ -7,6 +7,7 @@
 import { settingsNamespace } from '@deepseek-ai/dsh-settings';
 import { COMPUTER_USE_NAMESPACE, ComputerUseConfigSchema } from "./config.js";
 import { registerComputerUseRpc } from "./rpc.js";
+import { initRuntime } from "./runtime.js";
 import { defineActivateWindowTool, defineClickTool, defineDragTool, defineGetWindowStateTool, defineLaunchAppTool, defineListWindowsTool, definePressKeyTool, defineScrollTool, defineTypeTextTool, disposeRuntime, } from "./tools.js";
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-computer-use';
@@ -17,6 +18,9 @@ export function apply(ctx) {
     const getConfig = () => scope.get();
     ctx.effect(() => registerComputerUseRpc(ctx, scope), 'dsh-computer-use: RPC channel');
     ctx.effect(() => {
+        // Wire the production runtime: it constructs the guarded provider
+        // (createProvider + guardProvider) that every tool call goes through.
+        initRuntime({ ctx, getConfig });
         const disposers = [
             ctx.tools.register(defineListWindowsTool({ ctx, getConfig })),
             ctx.tools.register(defineGetWindowStateTool({ ctx, getConfig })),

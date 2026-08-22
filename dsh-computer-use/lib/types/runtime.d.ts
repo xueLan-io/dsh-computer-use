@@ -1,35 +1,78 @@
-import * as native from 'dsh-computer-use-native';
-export type Rect = native.Rect;
-export type DesktopWindow = native.WindowIdentity;
-export type AccessibilityNode = native.AccessibilityNode;
+/**
+ * Production runtime facade.
+ *
+ * The tools call into this module; it owns the SINGLE protected entry into
+ * desktop control:
+ *
+ *   tools -> runtime -> GuardedDesktopProvider (core/guard) -> platform
+ *   provider (createProvider, e.g. WindowsProvider) -> native addon
+ *
+ * Observation validation and action execution go through the shared core
+ * (`core/observation.ts` / `core/actions.ts`), so every future platform
+ * provider built on `createProvider()` is protected by the same permission,
+ * approval, session-isolation and TOCTOU gates without per-platform code.
+ * @module
+ */
+import type { Context } from '@deepseek-ai/cordis';
+import { ComputerUseError, type ActionErrorCode } from './core/errors.ts';
+import { type WindowId } from './core/identity.ts';
+import { type Capabilities } from './core/capability.ts';
+import { type ObservationOwner } from './core/observation.ts';
+import type { DesktopWindow, Rect } from './core/types.ts';
+export { ComputerUseError, type ActionErrorCode, type WindowId };
+export type { Rect };
+export type { DesktopWindow };
+export type AccessibilityNode = import('./core/types.ts').AccessibilityNode;
 export type WindowState = DesktopWindow & {
     screenshotPath?: string;
     screenshotRect?: Rect;
     coordinateSpace?: 'screenshot';
     accessibilityTree?: AccessibilityNode[];
     uiaChecksum?: string;
-    uiaChecksumMode?: 'full' | 'top-level';
+    uiaChecksumMode?: 'full' | 'top-level' | 'platform';
     uiaTruncated?: boolean;
 };
 export type Observation = WindowState & {
     observationId: string;
     createdAt: number;
     expiresAt: number;
+    sessionId: string;
+    agentId: string;
 };
-export type ActionErrorCode = 'INVALID_OBSERVATION' | 'OBSOLETE_OBSERVATION' | 'OBSERVATION_WINDOW_MISMATCH' | 'WINDOW_IDENTITY_CHANGED' | 'UIA_TREE_CHANGED' | 'PROTECTED_WINDOW' | 'WINDOW_NOT_FOUND' | 'COORDINATE_OUT_OF_BOUNDS' | 'NATIVE_PROVIDER_UNAVAILABLE' | 'ELEMENT_NOT_FOUND' | 'CLIPBOARD_FAILED';
-export declare class ComputerUseError extends Error {
-    readonly code: string;
-    readonly recovery: 'REQUIRES_REFRESH' | 'DENY' | 'RETRY' | 'NONE';
-    constructor(code: string, message: string, recovery?: ComputerUseError['recovery']);
-    toJSON(): object;
+interface ApprovalExec {
+    agent?: unknown;
+    name: string;
+    callId: unknown;
+    signal: AbortSignal;
 }
-export declare function assertSafeWindow(windowId: number, action?: string): DesktopWindow;
-export declare function listWindows(): DesktopWindow[];
-export declare function getWindow(id: number): DesktopWindow;
-export declare function createObservation(windowId: number, value: WindowState): Observation;
-export declare function validateObservation(observationId: string, windowId: number, action: string): Observation;
+interface RuntimeHooks {
+    ctx: Context;
+    getConfig: () => {
+        enabled: boolean;
+        allowControl: boolean;
+        requireApproval: boolean;
+        skipApprovalWhenPolicyNever: boolean;
+    };
+}
+export declare function initRuntime(h: RuntimeHooks): void;
+/** Attach the executing tool call so approval questions carry the right ids. */
+export declare function setApprovalContext(exec: ApprovalExec): void;
+/** Owner used for observations/approval; set from the tool exec context. */
+export declare function setObservationOwner(owner: ObservationOwner): void;
+export declare function observationOwner(): ObservationOwner;
+export declare function getWindow(id: number | WindowId): Promise<DesktopWindow>;
+export declare function assertSafeWindow(windowId: number | WindowId, action?: string): Promise<DesktopWindow>;
+export declare function listWindows(): Promise<DesktopWindow[]>;
+/** Windows provider capability report. */
+export declare function capabilities(): Capabilities;
+export declare function activate(id: number | WindowId): Promise<object>;
+export declare function createObservation(windowId: number | WindowId, value: WindowState): Promise<import("./core/observation.ts").Observation>;
+export interface ObservationValidationOptions {
+    requireAccessibilityTree?: boolean;
+}
+export declare function validateObservation(observationId: string, windowId: number | WindowId, action: string, options?: ObservationValidationOptions): Promise<import("./core/observation.ts").Observation>;
 export type CoordinateSpace = 'auto' | 'screenshot' | 'screen' | 'window';
-export declare function point(window: DesktopWindow, x: number, y: number, observation?: Observation, coordinateSpace?: CoordinateSpace): {
+export declare function point(window: DesktopWindow, x: number, y: number, _observation?: Observation, coordinateSpace?: CoordinateSpace): {
     x: number;
     y: number;
 };
@@ -37,38 +80,40 @@ interface OverlayConfig {
     overlayEnabled: boolean;
     overlayIdleMs: number;
     overlayText: string;
-    /** Deprecated: the native overlay color is fixed to the DSH brand blue; kept only for config compatibility. */
+    /** Deprecated: the native overlay color is fixed to the DSH brand blue. */
     overlayColor: string;
 }
 export declare function configureOverlay(config: OverlayConfig): void;
-export declare function showOverlay(windowId?: number): void;
-export declare function capture(windowId: number, path: string): {
+/** Shows the feedback overlay before a tool even asks for approval. */
+export declare function showOverlay(windowId?: number | WindowId): Promise<void>;
+export declare function capture(windowId: number | WindowId, path: string): Promise<{
     path: string;
     rect: Rect;
-};
-export declare function activate(windowId: number): object;
+}>;
 export interface ClickOptions {
     elementIndex?: number;
     clickMethod?: 'auto' | 'post';
 }
-export declare function click(windowId: number, x: number, y: number, button: 'left' | 'middle' | 'right', count: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: ClickOptions): object;
-export declare function typeText(windowId: number, value: string): object;
-export declare function pressKey(windowId: number, value: string): object;
+export declare function click(windowId: number | WindowId, x: number, y: number, button: 'left' | 'middle' | 'right', count: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: ClickOptions): Promise<object>;
+export declare function typeText(windowId: number | WindowId, value: string, observation?: Observation): Promise<object>;
+export declare function pressKey(windowId: number | WindowId, value: string, observation?: Observation): Promise<object>;
 export interface ScrollOptions {
     elementIndex?: number;
 }
-export declare function scroll(windowId: number, x: number, y: number, scrollX: number, scrollY: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: ScrollOptions): object;
+export declare function scroll(windowId: number | WindowId, x: number, y: number, scrollX: number, scrollY: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: ScrollOptions): Promise<object>;
 export interface DragOptions {
     fromElementIndex?: number;
     toElementIndex?: number;
 }
-export declare function drag(windowId: number, fromX: number, fromY: number, toX: number, toY: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: DragOptions): object;
-export declare function accessibilityTree(windowId: number): {
+export declare function drag(windowId: number | WindowId, fromX: number, fromY: number, toX: number, toY: number, observation?: Observation, coordinateSpace?: CoordinateSpace, options?: DragOptions): Promise<object>;
+export declare function accessibilityTree(windowId: number | WindowId): Promise<{
     nodes: AccessibilityNode[];
     checksum: string;
-    mode: 'full' | 'top-level';
+    mode: 'full' | 'top-level' | 'platform';
     truncated: boolean;
-};
-export declare function disposeRuntime(): void;
+}>;
+export declare function disposeRuntime(): Promise<void>;
 export declare function stopControlSession(): void;
-export {};
+export declare function stopControlIndicator(): Promise<void>;
+export declare function launchApp(app: unknown, args?: readonly unknown[]): Promise<object>;
+export type { ObservationOwner } from './core/observation.ts';

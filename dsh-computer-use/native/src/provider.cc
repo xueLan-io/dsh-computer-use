@@ -1,4 +1,4 @@
-﻿#ifndef NOMINMAX
+#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #ifndef WIN32_LEAN_AND_MEAN
@@ -11,6 +11,7 @@
 #include <napi.h>
 #include <windows.h>
 #include <objbase.h>
+#include <ole2.h>
 #include <uiautomation.h>
 #include <gdiplus.h>
 #include <psapi.h>
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
+#include <map>
 #include <deque>
 #include <cmath>
 
@@ -40,6 +42,42 @@ static std::wstring text(HWND h) { wchar_t b[1024]{}; GetWindowTextW(h, b, 1024)
 static std::wstring cls(HWND h) { wchar_t b[512]{}; GetClassNameW(h, b, 512); return b; }
 static HWND hwndOf(const CallbackInfo& i, int n = 0) { return (HWND)(UINT_PTR)i[n].ToNumber().Int64Value(); }
 static RECT virtualScreenRect();
+
+// ---------- window generation token ----------
+// Every HWND we observe gets a per-window "generation" property. The property
+// dies with the window, so a reused HWND value (old window destroyed, new
+// window created) never inherits the old token: any observation validated
+// against the old generation is rejected. This is the TOCTOU guard the
+// TS-side observation validation compares.
+static const wchar_t* kGenerationProp = L"DSH_CU_WINDOW_GENERATION";
+static uint64_t generationCounter = 0;
+
+static uint64_t windowGeneration(HWND h) {
+  if (!IsWindow(h)) return 0;
+  HANDLE v = GetPropW(h, kGenerationProp);
+  if (v) return (uint64_t)(uintptr_t)v;
+  uint64_t gen = ++generationCounter;
+  // gen 0 is reserved (NULL handle); wrap-around is unreachable in practice.
+  SetPropW(h, kGenerationProp, (HANDLE)(uintptr_t)gen);
+  return gen;
+}
+
+// ---------- stable checksums ----------
+// FNV-1a 64-bit: deterministic across processes and runs (std::hash is not
+// required to be stable and the review flagged it).
+static uint64_t fnv1a64(const std::string& s) {
+  uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+static std::string hex64(uint64_t v) {
+  char b[17];
+  snprintf(b, sizeof(b), "%016llx", (unsigned long long)v);
+  return std::string(b);
+}
 
 // ---------- DPI ----------
 static void EnsureDpiAware() {
@@ -118,7 +156,16 @@ static Object identity(Env e, HWND h) {
   o.Set("onScreen", intersectsVirtualScreen(r));
   o.Set("foreground", GetForegroundWindow() == h);
   o.Set("dpi", (double)windowDpi(h));
+  o.Set("generation", (double)windowGeneration(h));
   return o;
+}
+
+static Value VerifyWindow(const CallbackInfo& info) {
+  HWND h = hwndOf(info);
+  uint64_t gen = info.Length() > 1 ? (uint64_t)info[1].ToNumber().Int64Value() : 0;
+  if (!IsWindow(h)) return Boolean::New(info.Env(), false);
+  if (gen == 0) return Boolean::New(info.Env(), true);
+  return Boolean::New(info.Env(), windowGeneration(h) == gen);
 }
 
 // ---------- GDI+ singleton ----------
@@ -143,21 +190,29 @@ static bool saveScreenRect(const RECT& r, const std::wstring& file) {
   int h = r.bottom - r.top;
   if (w <= 0 || h <= 0) return false;
   HDC screen = GetDC(nullptr);
+  if (!screen) return false;
   HDC mem = CreateCompatibleDC(screen);
   HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
-  if (!screen || !mem || !bmp) {
+  if (!mem || !bmp) {
     if (bmp) DeleteObject(bmp);
     if (mem) DeleteDC(mem);
     if (screen) ReleaseDC(nullptr, screen);
     return false;
   }
   HGDIOBJ old = SelectObject(mem, bmp);
+  if (!old || old == HGDI_ERROR) {
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return false;
+  }
   BOOL copied = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
   SelectObject(mem, old);
   DeleteDC(mem);
   ReleaseDC(nullptr, screen);
   if (!copied) { DeleteObject(bmp); return false; }
   ensureGdiplus();
+  if (!gdiplusToken) { DeleteObject(bmp); return false; }
   bool ok = false;
   {
     Bitmap image(bmp, (HPALETTE)nullptr);
@@ -234,6 +289,59 @@ static Value TypeText(const CallbackInfo& info) {
 }
 
 // ---------- clipboard ----------
+// Snapshots are keyed (default "default") so concurrent or cross-session
+// paste flows cannot restore the wrong content. Each entry owns its IDataObject
+// and the COM initialization block it was captured under.
+struct ClipboardSnapshot {
+  IDataObject* data = nullptr;
+  bool ownsCom = false;
+};
+static std::map<std::string, ClipboardSnapshot> clipboardSnapshots;
+
+static std::string clipboardKey(const CallbackInfo& info, int n = 0) {
+  if (info.Length() > n && info[n].IsString()) return info[n].ToString().Utf8Value();
+  return "default";
+}
+
+static void clearClipboardSnapshot(const std::string& key) {
+  auto it = clipboardSnapshots.find(key);
+  if (it == clipboardSnapshots.end()) return;
+  if (it->second.data) it->second.data->Release();
+  if (it->second.ownsCom) CoUninitialize();
+  clipboardSnapshots.erase(it);
+}
+
+static Value ClipboardSave(const CallbackInfo& info) {
+  Env env = info.Env();
+  std::string key = clipboardKey(info);
+  clearClipboardSnapshot(key);
+  HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  // Only a fresh S_OK init is owned; S_FALSE (already initialized) and
+  // RPC_E_CHANGED_MODE (foreign apartment) must not be un-initialized here.
+  const bool ownsCom = (com == S_OK);
+  if (FAILED(com) && com != RPC_E_CHANGED_MODE) return Boolean::New(env, false);
+
+  IDataObject* data = nullptr;
+  HRESULT hr = OleGetClipboard(&data);
+  if (FAILED(hr) || !data) {
+    if (ownsCom) CoUninitialize();
+    return Boolean::New(env, false);
+  }
+  clipboardSnapshots[key] = { data, ownsCom };
+  return Boolean::New(env, true);
+}
+
+static Value ClipboardRestore(const CallbackInfo& info) {
+  Env env = info.Env();
+  std::string key = clipboardKey(info);
+  auto it = clipboardSnapshots.find(key);
+  if (it == clipboardSnapshots.end()) return Boolean::New(env, false);
+  const HRESULT hr = OleSetClipboard(it->second.data);
+  const bool ok = SUCCEEDED(hr);
+  clearClipboardSnapshot(key);
+  return Boolean::New(env, ok);
+}
+
 static Value ClipboardGet(const CallbackInfo& info) {
   Env env = info.Env();
   std::wstring out;
@@ -293,11 +401,11 @@ static Value PostClick(const CallbackInfo& info) {
   WPARAM downWp = MK_LBUTTON, upWp = 0;
   if (b == "right" || b == "r") { down = WM_RBUTTONDOWN; up = WM_RBUTTONUP; downWp = MK_RBUTTON; }
   else if (b == "middle" || b == "m") { down = WM_MBUTTONDOWN; up = WM_MBUTTONUP; downWp = MK_MBUTTON; }
+  if (b != "left" && b != "l" && b != "right" && b != "r" && b != "middle" && b != "m") return Boolean::New(info.Env(), false);
   for (int i = 0; i < count; i++) {
-    PostMessageW(h, move, 0, lp);
-    PostMessageW(h, down, downWp, lp);
+    if (!PostMessageW(h, move, 0, lp) || !PostMessageW(h, down, downWp, lp)) return Boolean::New(info.Env(), false);
     Sleep(35);
-    PostMessageW(h, up, upWp, lp);
+    if (!PostMessageW(h, up, upWp, lp)) return Boolean::New(info.Env(), false);
     Sleep(50);
   }
   return Boolean::New(info.Env(), true);
@@ -311,7 +419,7 @@ static Value PostWheel(const CallbackInfo& info) {
   bool horizontal = info.Length() > 4 && info[4].ToBoolean();
   POINT pt{};
   if (!postPoint(h, screenX, screenY, pt)) return Boolean::New(info.Env(), false);
-  WPARAM wp = (WPARAM)((delta << 16) & 0xFFFFFFFFu);
+  WPARAM wp = (WPARAM)((WPARAM)(WORD)delta << 16);
   return Boolean::New(info.Env(), PostMessageW(h, horizontal ? WM_MOUSEHWHEEL : WM_MOUSEWHEEL, wp, MAKELPARAM(pt.x, pt.y)) != FALSE);
 }
 
@@ -451,12 +559,17 @@ static IUIAutomationElement* elementAt(IUIAutomation* uia, IUIAutomationElement*
     if (!x || found || count >= maxNodes || depth > maxDepth) return false;
     int me = count++;
     if (me == target) { found = x; found->AddRef(); return true; }
+    if (depth >= maxDepth) return false;
     IUIAutomationTreeWalker* walker = nullptr;
     if (SUCCEEDED(uia->get_ControlViewWalker(&walker))) {
       IUIAutomationElement* child = nullptr;
       walker->GetFirstChildElement(x, &child);
       while (child && !found) {
-        if (visit(child, depth + 1)) { walker->Release(); return true; }
+        if (visit(child, depth + 1)) {
+          child->Release();
+          walker->Release();
+          return true;
+        }
         IUIAutomationElement* next = nullptr;
         walker->GetNextSiblingElement(child, &next);
         child->Release();
@@ -590,21 +703,75 @@ static Value BackgroundInvoke(const CallbackInfo& info) {
 }
 
 // ---------- capture (PNG via GDI+) ----------
+// True when every pixel of a 32bpp bitmap is zero (used to detect PrintWindow
+// producing a blank surface, which some drivers do instead of failing).
+static bool bitmapIsBlank(HBITMAP bmp, int w, int h) {
+  if (w <= 0 || h <= 0) return true;
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  std::vector<BYTE> pixels((size_t)w * h * 4, 0);
+  HDC dc = GetDC(nullptr);
+  int lines = dc ? GetDIBits(dc, bmp, 0, h, pixels.data(), &bi, DIB_RGB_COLORS) : 0;
+  if (dc) ReleaseDC(nullptr, dc);
+  if (lines != h) return false; // cannot verify -> assume not blank
+  for (size_t i = 0; i < pixels.size(); i += 4) {
+    if (pixels[i] || pixels[i + 1] || pixels[i + 2] || pixels[i + 3]) return false;
+  }
+  return true;
+}
+
 static Value Capture(const CallbackInfo& info) {
   Env env = info.Env();
   HWND h = hwndOf(info);
+  if (!IsWindow(h)) return Boolean::New(env, false);
   RECT r{};
   if (!GetWindowRect(h, &r) || r.right <= r.left || r.bottom <= r.top) return Boolean::New(env, false);
   int w = r.right - r.left, hh = r.bottom - r.top;
   HDC screen = GetDC(nullptr);
+  if (!screen) return Boolean::New(env, false);
   HDC mem = CreateCompatibleDC(screen);
   HBITMAP bmp = CreateCompatibleBitmap(screen, w, hh);
+  if (!mem || !bmp) {
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return Boolean::New(env, false);
+  }
   HGDIOBJ old = SelectObject(mem, bmp);
-  BitBlt(mem, 0, 0, w, hh, screen, r.left, r.top, SRCCOPY);
+  if (!old || old == HGDI_ERROR) {
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return Boolean::New(env, false);
+  }
+  // Window-isolated capture: PrintWindow(PW_RENDERFULLCONTENT) renders the
+  // target window's own content even when it is occluded, so screenshots never
+  // leak other applications (review: the old screen BitBlt+crop path included
+  // whatever was drawn on top of the window). Fall back to the screen BitBlt
+  // only when PrintWindow is unsupported or produced a blank surface.
+  BOOL copied = PrintWindow(h, mem, PW_RENDERFULLCONTENT);
+  if (copied && !bitmapIsBlank(bmp, w, hh)) {
+    copied = TRUE;
+  } else {
+    copied = BitBlt(mem, 0, 0, w, hh, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+  }
   SelectObject(mem, old);
   DeleteDC(mem);
   ReleaseDC(nullptr, screen);
+  if (!copied) {
+    DeleteObject(bmp);
+    return Boolean::New(env, false);
+  }
   ensureGdiplus();
+  if (!gdiplusToken) {
+    DeleteObject(bmp);
+    return Boolean::New(env, false);
+  }
   std::wstring file = utf16(info[1].ToString().Utf16Value());
   bool ok = false;
   {
@@ -647,9 +814,14 @@ static Value Uia(const CallbackInfo& info) {
   Array nodes = Array::New(env);
   std::stringstream sum;
   int count = 0;
+  bool truncated = false;
   std::function<void(IUIAutomationElement*, int, int)> visit;
   visit = [&](IUIAutomationElement* x, int parent, int depth) {
-    if (!x || count >= maxNodes || depth > maxDepth) return;
+    if (!x) return;
+    if (count >= maxNodes || depth > maxDepth) {
+      truncated = true;
+      return;
+    }
     BSTR name = nullptr, aid = nullptr;
     CONTROLTYPEID role = 0;
     x->get_CurrentName(&name);
@@ -671,7 +843,10 @@ static Value Uia(const CallbackInfo& info) {
     o.Set("visible", !off);
     o.Set("childCount", 0);
     nodes.Set(count, o);
-    sum << count << ":" << (name ? utf8(name) : "") << ":" << role << ";";
+    sum << count << ":" << parent << ":" << (name ? utf8(name) : "") << ":"
+        << (aid ? utf8(aid) : "") << ":" << role << ":"
+        << rr.left << "," << rr.top << "," << rr.right << "," << rr.bottom << ":"
+        << (en ? "1" : "0") << (off ? "0" : "1") << ";";
     int me = count++;
     if (name) SysFreeString(name);
     if (aid) SysFreeString(aid);
@@ -680,6 +855,15 @@ static Value Uia(const CallbackInfo& info) {
       IUIAutomationElement* child = nullptr;
       walker->GetFirstChildElement(x, &child);
       int cc = 0;
+      if (depth >= maxDepth) {
+        if (child) {
+          truncated = true;
+          child->Release();
+        }
+        o.Set("childCount", 0);
+        walker->Release();
+        return;
+      }
       while (child && count < maxNodes) {
         visit(child, me, depth + 1);
         cc++;
@@ -687,6 +871,10 @@ static Value Uia(const CallbackInfo& info) {
         walker->GetNextSiblingElement(child, &next);
         child->Release();
         child = next;
+      }
+      if (child) {
+        truncated = true;
+        child->Release();
       }
       o.Set("childCount", cc);
       walker->Release();
@@ -696,12 +884,13 @@ static Value Uia(const CallbackInfo& info) {
   root->Release();
   uia->Release();
   if (ownsCom) CoUninitialize();
-  std::hash<std::string> hsh;
   Object out = Object::New(env);
   out.Set("nodes", nodes);
-  out.Set("truncated", count >= maxNodes);
-  out.Set("checksum", std::to_string(hsh(sum.str())));
-  out.Set("mode", count >= maxNodes ? "top-level" : "full");
+  out.Set("truncated", truncated);
+  // FNV-1a 64-bit checksum: stable across processes/runs (std::hash is not),
+  // and computed over identity + geometry + enabled/visible state.
+  out.Set("checksum", hex64(fnv1a64(sum.str())));
+  out.Set("mode", truncated ? "top-level" : "full");
   return out;
 }
 
@@ -1189,6 +1378,7 @@ Object Init(Env env, Object exports) {
   EnsureDpiAware();
   exports.Set("listWindows", Function::New(env, ListWindows));
   exports.Set("getWindow", Function::New(env, QueryWindow));
+  exports.Set("verifyWindow", Function::New(env, VerifyWindow));
   exports.Set("captureWindow", Function::New(env, Capture));
   exports.Set("screenRect", Function::New(env, ScreenRect));
   exports.Set("captureScreen", Function::New(env, CaptureScreen));
@@ -1205,6 +1395,8 @@ Object Init(Env env, Object exports) {
   exports.Set("postClick", Function::New(env, PostClick));
   exports.Set("postWheel", Function::New(env, PostWheel));
   exports.Set("postChar", Function::New(env, PostChar));
+  exports.Set("saveClipboard", Function::New(env, ClipboardSave));
+  exports.Set("restoreClipboard", Function::New(env, ClipboardRestore));
   exports.Set("setClipboardText", Function::New(env, ClipboardSet));
   exports.Set("getClipboardText", Function::New(env, ClipboardGet));
   exports.Set("paste", Function::New(env, Paste));

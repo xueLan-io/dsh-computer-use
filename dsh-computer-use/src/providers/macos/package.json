@@ -1,0 +1,18 @@
+{
+  "name": "dsh-computer-use-macos-native",
+  "version": "0.1.0",
+  "description": "Native macOS provider for dsh-computer-use (draft; validated on macOS CI runners).",
+  "type": "module",
+  "gypfile": true,
+  "install": "node-gyp-build || node-gyp rebuild",
+  "scripts": {
+    "build": "node-gyp rebuild"
+  },
+  "binary": { "napi_versions": [9], "module_path": "build/Release" },
+  "os": ["darwin"],
+  "devDependencies": {
+    "node-addon-api": "^8.9.2",
+    "node-gyp": "^12.4.0",
+    "node-gyp-build": "^4.8.4"
+  }
+}

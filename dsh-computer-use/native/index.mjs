@@ -23,6 +23,7 @@ export const runtimeInfo = () => ({
 })
 export const listWindows = native.listWindows
 export const getWindow = native.getWindow
+export const verifyWindow = native.verifyWindow
 export const captureWindow = native.captureWindow
 export const screenRect = native.screenRect
 export const captureScreen = native.captureScreen
@@ -39,6 +40,10 @@ export const drag = native.drag
 export const postClick = native.postClick
 export const postWheel = native.postWheel
 export const postChar = native.postChar
+// Clipboard snapshots are keyed by session owner so concurrent or cross-session
+// paste flows never restore the wrong content.
+export const saveClipboard = (key) => native.saveClipboard(typeof key === 'string' ? key : 'default')
+export const restoreClipboard = (key) => native.restoreClipboard(typeof key === 'string' ? key : 'default')
 export const setClipboardText = native.setClipboardText
 export const getClipboardText = native.getClipboardText
 export const paste = native.paste

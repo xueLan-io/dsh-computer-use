@@ -1,0 +1,15 @@
+{
+  "name": "dsh-computer-use-core",
+  "version": "0.2.0",
+  "description": "Platform-neutral core for dsh-computer-use (placeholder).",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "engines": { "node": ">=22.19.0" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "peer",
+    "@deepseek-ai/dsh-tools": "peer",
+    "@deepseek-ai/dsh-settings": "peer",
+    "@deepseek-ai/dsh-user-approval": "peer"
+  }
+}

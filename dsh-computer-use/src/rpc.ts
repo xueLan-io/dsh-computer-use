@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { ComputerUseConfig } from './config.ts'
+import { stopControlSession } from './runtime.ts'
 
 /** Loopback RPC channel used by the permission bubble. */
 export const COMPUTER_USE_RPC_CHANNEL = '/computer-use'
@@ -51,7 +52,10 @@ export function registerComputerUseRpc(
           case 'allowControl/set': {
             // 写入授权状态；只有显式 true 才算授权。
             const value = (payload ?? {}) as { allowed?: unknown }
-            await scope.update({ allowControl: value.allowed === true })
+            const allowed = value.allowed === true
+            const changed = scope.get().allowControl !== allowed
+            await scope.update({ allowControl: allowed })
+            if (changed) stopControlSession()
             return ok({ allowed: scope.get().allowControl === true })
           }
           default: {

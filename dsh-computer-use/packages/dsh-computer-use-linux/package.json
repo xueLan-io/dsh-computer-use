@@ -1,0 +1,7 @@
+{
+  "name": "dsh-computer-use-linux",
+  "version": "0.1.0",
+  "description": "Linux provider package for dsh-computer-use (placeholder).",
+  "type": "module",
+  "os": ["linux"]
+}

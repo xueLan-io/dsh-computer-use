@@ -4,17 +4,18 @@
   "description": "Windows Node-API provider for DSH Computer Use",
   "license": "BSD-3-Clause",
   "type": "module",
+  "os": ["win32"],
+  "cpu": ["x64"],
   "main": "index.mjs",
   "types": "index.d.ts",
   "gypfile": true,
   "files": ["index.mjs", "index.d.ts", "binding.gyp", "src", "build/Release/*.node"],
   "scripts": {
-    "install": "node-gyp-build",
+    "install": "node -e \"const root=process.cwd(); try { require('node-gyp-build')(root); } catch (error) { if (process.platform !== 'win32' || process.arch !== 'x64') process.exit(0); console.error('dsh-computer-use-native: prebuilt provider unavailable, building locally'); require('child_process').execFileSync(process.execPath, [require.resolve('node-gyp/bin/node-gyp.js'), 'rebuild'], {cwd:root,stdio:'inherit'}); }\"",
     "prepack": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "test:load": "node -e \"import('./index.mjs').then((m) => console.log(m.runtimeInfo()))\""
   },
   "engines": { "node": ">=22.19.0" },
-  "dependencies": { "node-addon-api": "^8.9.2", "node-gyp-build": "^4.8.4" },
-  "devDependencies": { "node-gyp": "^12.4.0" }
+  "dependencies": { "node-addon-api": "^8.9.2", "node-gyp": "^12.4.0", "node-gyp-build": "^4.8.4" }
 }

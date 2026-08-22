@@ -1,0 +1,36 @@
+/**
+ * Cross-platform window/element identity.
+ *
+ * HWND numeric ids are Windows-specific. As the plugin grows a macOS/Linux
+ * provider we need a string `WindowId`/`ElementId` scheme. Windows keeps
+ * accepting the legacy numeric HWND by wrapping it in a `win:hWnd:<hex>`
+ * string while the native layer continues to operate on the raw HWND.
+ * @module
+ */
+const HWND_PREFIX = 'win:hWnd:';
+/** Resolve a legacy numeric HWND (or existing string) into a stable WindowId. */
+export function resolveWindowId(input) {
+    if (typeof input === 'number') {
+        if (!Number.isInteger(input) || input < 0) {
+            throw new TypeError(`Invalid window id: ${input}`);
+        }
+        return `${HWND_PREFIX}${input.toString(16).padStart(16, '0')}`;
+    }
+    return input;
+}
+/** Parse a WindowId into platform + raw payload; non-parsable returns null. */
+export function parseWindowId(id) {
+    const idx = id.indexOf(':');
+    if (idx <= 0)
+        return null;
+    return { platform: id.slice(0, idx), raw: id.slice(idx + 1) };
+}
+/** Extract the legacy Windows HWND from a WindowId; undefined when not Windows. */
+export function extractLegacyHwnd(id) {
+    if (!id.startsWith(HWND_PREFIX))
+        return undefined;
+    const raw = id.slice(HWND_PREFIX.length);
+    if (!/^[0-9a-fA-F]+$/.test(raw))
+        return undefined;
+    return Number.parseInt(raw, 16);
+}

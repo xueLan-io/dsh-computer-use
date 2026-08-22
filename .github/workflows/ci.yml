@@ -1,0 +1,81 @@
+name: dsh-computer-use CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+
+jobs:
+  core:
+    name: Core contract tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dsh-computer-use
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run test:contract
+
+  windows:
+    name: Windows provider
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: dsh-computer-use
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install
+      - run: npm run build
+      - run: npm run test:contract
+      - run: npm pack --dry-run
+
+  macos:
+    name: macOS provider (build draft)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: dsh-computer-use
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run test:contract
+      # The native addon is still a draft (provider.mm was never compiled on a
+      # real Mac). Build it so CI surfaces compilation errors, but keep the
+      # steps non-fatal until the source compiles clean on macOS. Remove
+      # continue-on-error once `npm --prefix src/providers/macos run build`
+      # passes green.
+      - run: npm --prefix src/providers/macos install --ignore-scripts
+        continue-on-error: true
+      - run: npm --prefix src/providers/macos run build
+        continue-on-error: true
+
+  linux:
+    name: Linux helper (build + Xvfb smoke)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dsh-computer-use
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libxext-dev zlib1g-dev xvfb
+      - run: npm install --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run test:contract
+      - run: make -C src/providers/linux/x11
+      - name: Xvfb end-to-end smoke (helper JSON IP C)
+        run: node --experimental-strip-types scripts/x11-smoke.mjs

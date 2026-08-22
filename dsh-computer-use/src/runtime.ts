@@ -1,478 +1,482 @@
-import * as native from 'dsh-computer-use-native'
+/**
+ * Production runtime facade.
+ *
+ * The tools call into this module; it owns the SINGLE protected entry into
+ * desktop control:
+ *
+ *   tools -> runtime -> GuardedDesktopProvider (core/guard) -> platform
+ *   provider (createProvider, e.g. WindowsProvider) -> native addon
+ *
+ * Observation validation and action execution go through the shared core
+ * (`core/observation.ts` / `core/actions.ts`), so every future platform
+ * provider built on `createProvider()` is protected by the same permission,
+ * approval, session-isolation and TOCTOU gates without per-platform code.
+ * @module
+ */
 
-export type Rect = native.Rect
-export type DesktopWindow = native.WindowIdentity
-export type AccessibilityNode = native.AccessibilityNode
+import type { Context } from '@deepseek-ai/cordis'
+import { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import { ComputerUseError, type ActionErrorCode } from './core/errors.ts'
+import { brandProtected as brandProtectedCore } from './core/protection.ts'
+import { point as pointCore, validateElementIndex as validateElementIndexCore } from './core/point.ts'
+import { resolveWindowId, extractLegacyHwnd, type WindowId } from './core/identity.ts'
+import { windowsCapabilities, type Capabilities } from './core/capability.ts'
+import { guardProvider, type GuardHooks } from './core/guard.ts'
+import { createProvider } from './providers/index.ts'
+import {
+  createObservation as createCoreObservation,
+  validateObservation as validateCoreObservation,
+  __clearObservationsForTest,
+  type ObservationOwner,
+} from './core/observation.ts'
+import { runClick, runDrag, runPressKey, runScroll, runTypeText } from './core/actions.ts'
+import type { DesktopProvider, DesktopWindow, Rect } from './core/types.ts'
+
+export { ComputerUseError, type ActionErrorCode, type WindowId }
+export type { Rect }
+export type { DesktopWindow }
+export type AccessibilityNode = import('./core/types.ts').AccessibilityNode
+
 export type WindowState = DesktopWindow & {
   screenshotPath?: string
   screenshotRect?: Rect
   coordinateSpace?: 'screenshot'
   accessibilityTree?: AccessibilityNode[]
   uiaChecksum?: string
-  uiaChecksumMode?: 'full' | 'top-level'
+  uiaChecksumMode?: 'full' | 'top-level' | 'platform'
   uiaTruncated?: boolean
 }
 export type Observation = WindowState & {
   observationId: string
   createdAt: number
   expiresAt: number
-}
-export type ActionErrorCode =
-  | 'INVALID_OBSERVATION'
-  | 'OBSOLETE_OBSERVATION'
-  | 'OBSERVATION_WINDOW_MISMATCH'
-  | 'WINDOW_IDENTITY_CHANGED'
-  | 'UIA_TREE_CHANGED'
-  | 'PROTECTED_WINDOW'
-  | 'WINDOW_NOT_FOUND'
-  | 'COORDINATE_OUT_OF_BOUNDS'
-  | 'NATIVE_PROVIDER_UNAVAILABLE'
-  | 'ELEMENT_NOT_FOUND'
-  | 'CLIPBOARD_FAILED'
-
-export class ComputerUseError extends Error {
-  readonly code: string
-  readonly recovery: 'REQUIRES_REFRESH' | 'DENY' | 'RETRY' | 'NONE'
-  constructor(code: string, message: string, recovery: ComputerUseError['recovery'] = 'NONE') {
-    super(message)
-    this.name = 'ComputerUseError'
-    this.code = code
-    this.recovery = recovery
-  }
-  toJSON(): object {
-    return { ok: false, code: this.code, recovery: this.recovery, message: this.message }
-  }
+  sessionId: string
+  agentId: string
 }
 
-const observations = new Map<string, Observation>()
 const protectedWindows = new Map<number, { processId: number; processPath: string; title: string; className: string }>()
-// Observations stay valid for 3 minutes: a real user action takes seconds to
-// reason about, and the previous 30s TTL plus strict rect equality forced the
-// model into an observe->timeout->re-observe death spiral on busy windows.
-const OBSERVATION_TTL = 180_000
-// A window that moved is still the same UI; only a size change invalidates
-// the screenshot geometry. Actions are window-relative, so they auto-remap
-// through the CURRENT rect.
-const RECT_TOLERANCE = 8
 const PROTECTED_WINDOWS_CAP = 512
 const TREE_MAX_NODES = 2000
 const TREE_MAX_DEPTH = 32
 
-function identity(windowId: number): DesktopWindow {
-  try {
-    return native.getWindow(windowId)
-  } catch {
-    throw new ComputerUseError('WINDOW_NOT_FOUND', `窗口 ${windowId} 不存在`, 'REQUIRES_REFRESH')
+// ---------------------------------------------------------------------------
+// Provider + guard construction (production wiring for createProvider /
+// guardProvider / core actions).
+// ---------------------------------------------------------------------------
+interface ApprovalExec {
+  agent?: unknown
+  name: string
+  callId: unknown
+  signal: AbortSignal
+}
+
+interface RuntimeHooks {
+  ctx: Context
+  getConfig: () => { enabled: boolean; allowControl: boolean; requireApproval: boolean; skipApprovalWhenPolicyNever: boolean }
+}
+
+let hooks: RuntimeHooks | null = null
+let provider: DesktopProvider | null = null
+let guarded: ReturnType<typeof guardProvider> | null = null
+let approvalExec: ApprovalExec | undefined
+
+/** Current observation owner (session/agent), set by the tool layer per call. */
+let currentOwner: ObservationOwner = { sessionId: 'unknown', agentId: 'unknown' }
+
+export function initRuntime(h: RuntimeHooks): void {
+  hooks = h
+}
+
+/** Attach the executing tool call so approval questions carry the right ids. */
+export function setApprovalContext(exec: ApprovalExec): void {
+  approvalExec = exec
+}
+
+function ensureProvider(): DesktopProvider {
+  if (!provider) provider = createProvider()
+  return provider
+}
+
+async function approveAction(reason: string): Promise<void> {
+  const h = hooks
+  if (!h) return
+  const config = h.getConfig()
+  if (!config.requireApproval || approvalExec === undefined || approvalExec.agent === undefined) return
+  const agent = approvalExec.agent as { session?: { events?: readonly unknown[] } }
+  const policy = effectiveApprovalPolicy((agent.session?.events ?? []) as never)
+  if (policy === 'never') {
+    if (config.skipApprovalWhenPolicyNever) return
+    await stopControlIndicator()
+    throw new Error('The session approval policy is "never ask", so this computer-control action is denied')
+  }
+  const outcome = await h.ctx.approval.request({
+    agent: agent as never,
+    toolName: approvalExec.name,
+    callId: approvalExec.callId as never,
+    reason,
+    signal: approvalExec.signal,
+  })
+  if (outcome !== 'allowed-once') {
+    await stopControlIndicator()
+    throw new Error('The user rejected this computer-control action')
   }
 }
 
-function brandProtected(window: DesktopWindow): boolean {
-  const title = window.title.toLowerCase()
-  const cls = window.className.toLowerCase()
-  // Match process-path SEGMENTS rather than substrings so a program living in
-  // a folder like "dsh-stuff" or "mysandsh" is not mistaken for DSH itself.
-  const segments = window.processPath.toLowerCase().split(/[\\/]/)
-  const dshProcess = segments.some(
-    (s) =>
-      s === 'dsh' || s === 'deepseek' || s === 'harness' ||
-      s.startsWith('dsh-') || s.startsWith('dsh_') ||
-      s.startsWith('deepseek-') || s.startsWith('deepseek_') ||
-      s.startsWith('harness-') || s.startsWith('harness_'),
-  )
-  const dshBrand = /deepseek|dsh harness|deepseek harness|deepseek-harness|^dsh$/.test(title)
-  const dshClass = /\b(dsh|deepseek|harness)\b/.test(cls)
-  return dshProcess || dshBrand || dshClass
+function ensureGuarded(): ReturnType<typeof guardProvider> {
+  if (!guarded) {
+    const guardHooks: GuardHooks = {
+      assertAllowed() {
+        const config = hooks?.getConfig()
+        if (!config?.enabled) throw new Error('计算机控制插件未启用')
+        if (!config.allowControl) throw new Error('DSH control permission is off: please enable the "Allow DSH to control the computer" switch next to the chat box')
+      },
+      // Approval runs exactly once, inside the guard. Screenshot capture and
+      // plain activation are deliberately NOT approval-gated (legacy
+      // behavior); the interactive gate applies to input/launch actions only.
+      approve: async (reason) => {
+        if (reason.startsWith('capture window') || reason.startsWith('activate window')) return
+        await approveAction(reason)
+      },
+    }
+    guarded = guardProvider(ensureProvider(), guardHooks)
+  }
+  return guarded
 }
 
-export function assertSafeWindow(windowId: number, action = 'control'): DesktopWindow {
-  const window = identity(windowId)
-  const known = protectedWindows.get(windowId)
-  if (known || brandProtected(window)) {
-    protectedWindows.set(windowId, {
+/** Owner used for observations/approval; set from the tool exec context. */
+export function setObservationOwner(owner: ObservationOwner): void {
+  currentOwner = owner
+}
+
+export function observationOwner(): ObservationOwner {
+  return currentOwner
+}
+
+function normalizeWindowId(input: number | WindowId): WindowId {
+  return resolveWindowId(input)
+}
+
+function hwndNumber(input: number | WindowId): number {
+  const id = normalizeWindowId(input)
+  const value = extractLegacyHwnd(id)
+  if (value === undefined) throw new ComputerUseError('WINDOW_NOT_FOUND', `Not a Windows HWND: ${id}`, 'REQUIRES_REFRESH')
+  return value
+}
+
+// ---------------------------------------------------------------------------
+// Window identity / enumeration
+// ---------------------------------------------------------------------------
+
+export async function getWindow(id: number | WindowId): Promise<DesktopWindow> {
+  try {
+    return await ensureProvider().getWindow(normalizeWindowId(id))
+  } catch {
+    throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${id} does not exist`, 'REQUIRES_REFRESH')
+  }
+}
+
+export async function assertSafeWindow(windowId: number | WindowId, action = 'control'): Promise<DesktopWindow> {
+  const window = await getWindow(windowId)
+  const numeric = hwndNumber(windowId)
+  const known = protectedWindows.get(numeric)
+  if (known || brandProtectedCore(window)) {
+    protectedWindows.set(numeric, {
       processId: window.processId,
       processPath: window.processPath,
       title: window.title,
       className: window.className,
     })
     while (protectedWindows.size > PROTECTED_WINDOWS_CAP) protectedWindows.delete(protectedWindows.keys().next().value!)
-    throw new ComputerUseError('PROTECTED_WINDOW', `禁止对受保护的 DSH 窗口执行 ${action}`, 'DENY')
+    throw new ComputerUseError('PROTECTED_WINDOW', `Operation ${action} on a protected DSH window is forbidden`, 'DENY')
   }
   return window
 }
 
-export function listWindows(): DesktopWindow[] {
-  return native.listWindows()
+export async function listWindows(): Promise<DesktopWindow[]> {
+  return ensureGuarded().listWindows()
 }
 
-function activateNative(windowId: number): DesktopWindow {
-  if (!native.activateWindow(windowId)) throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', '目标窗口无法激活或不在屏幕上', 'RETRY')
-  const current = identity(windowId)
+/** Windows provider capability report. */
+export function capabilities(): Capabilities {
+  return windowsCapabilities()
+}
+
+async function activateNative(id: number | WindowId): Promise<DesktopWindow> {
+  const windowId = normalizeWindowId(id)
+  await ensureGuarded().activateWindow(windowId)
+  const current = await getWindow(windowId)
   if (!current.foreground || !current.visible || current.minimized || !current.onScreen || !current.rect.width || !current.rect.height) {
-    throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', '目标窗口未成为前台可见窗口', 'RETRY')
+    throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', 'Target window did not become the foreground visible window', 'RETRY')
   }
   return current
 }
 
-export function getWindow(id: number): DesktopWindow {
-  return identity(id)
+export async function activate(id: number | WindowId): Promise<object> {
+  await assertSafeWindow(id, 'activate')
+  const current = await activateNative(id)
+  await showOverlay(id)
+  return { activated: true, windowId: id, foreground: current.foreground, rect: current.rect }
 }
 
-export function createObservation(windowId: number, value: WindowState): Observation {
-  const now = Date.now()
-  const observationId = `obs_${windowId.toString(16)}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+// ---------------------------------------------------------------------------
+// Observation (shared core, session-isolated)
+// ---------------------------------------------------------------------------
+
+export async function createObservation(windowId: number | WindowId, value: WindowState) {
+  const id = normalizeWindowId(windowId)
   // Capture may restore a minimized target, so persist the post-capture identity.
-  const item: Observation = { ...value, ...identity(windowId), observationId, createdAt: now, expiresAt: now + OBSERVATION_TTL }
-  observations.set(observationId, item)
-  while (observations.size > 128) observations.delete(observations.keys().next().value!)
-  return item
+  const window = await getWindow(id)
+  const { windowId: _ignored, ...rest } = value
+  void _ignored
+  return createCoreObservation(window, rest, currentOwner)
 }
 
-function sameIdentity(a: DesktopWindow, b: Observation): boolean {
-  return (
-    a.windowId === b.windowId &&
-    a.processId === b.processId &&
-    a.processPath === b.processPath &&
-    a.className === b.className
-  )
+export interface ObservationValidationOptions {
+  requireAccessibilityTree?: boolean
 }
 
-export function validateObservation(observationId: string, windowId: number, action: string): Observation {
-  const old = observations.get(observationId)
-  if (!old) throw new ComputerUseError('INVALID_OBSERVATION', 'observationId 无效，请重新观察', 'REQUIRES_REFRESH')
-  if (old.windowId !== windowId) throw new ComputerUseError('OBSERVATION_WINDOW_MISMATCH', 'observationId 不属于目标窗口，请重新观察', 'REQUIRES_REFRESH')
-  if (old.expiresAt <= Date.now()) {
-    observations.delete(observationId)
-    throw new ComputerUseError('OBSOLETE_OBSERVATION', 'observation 已过期，请重新获取窗口状态', 'REQUIRES_REFRESH')
+export async function validateObservation(
+  observationId: string,
+  windowId: number | WindowId,
+  action: string,
+  options: ObservationValidationOptions = {},
+) {
+  const id = normalizeWindowId(windowId)
+  return validateCoreObservation(observationId, id, ensureGuarded(), action, {
+    requireAccessibilityTree: options.requireAccessibilityTree,
+    owner: currentOwner,
+  })
+}
+
+async function actionObservation(
+  observation: Observation | undefined,
+  windowId: number | WindowId,
+  action: string,
+  requireAccessibilityTree = false,
+): Promise<void> {
+  if (!observation?.observationId) {
+    throw new ComputerUseError('INVALID_OBSERVATION', 'Action must use the observationId returned by the latest observation', 'REQUIRES_REFRESH')
   }
-  const current = identity(windowId)
-  const sizeMoved =
-    Math.abs(current.rect.width - old.rect.width) > RECT_TOLERANCE ||
-    Math.abs(current.rect.height - old.rect.height) > RECT_TOLERANCE
-  if (!sameIdentity(current, old) || sizeMoved) {
-    throw new ComputerUseError('WINDOW_IDENTITY_CHANGED', `窗口状态已变化，不能执行 ${action}`, 'REQUIRES_REFRESH')
-  }
-  if (brandProtected(current)) throw new ComputerUseError('PROTECTED_WINDOW', '禁止操作受保护的 DSH 窗口', 'DENY')
-  return old
+  await validateObservation(observation.observationId, windowId, action, { requireAccessibilityTree })
 }
 
 export type CoordinateSpace = 'auto' | 'screenshot' | 'screen' | 'window'
 
-export function point(window: DesktopWindow, x: number, y: number, observation?: Observation, coordinateSpace: CoordinateSpace = 'auto'): { x: number; y: number } {
-  if (coordinateSpace === 'screen') {
-    if (
-      !Number.isInteger(x) || !Number.isInteger(y) ||
-      x < window.rect.left || y < window.rect.top ||
-      x >= window.rect.right || y >= window.rect.bottom
-    ) {
-      throw new ComputerUseError('COORDINATE_OUT_OF_BOUNDS', `屏幕坐标 (${x}, ${y}) 不在目标窗口范围内`, 'REQUIRES_REFRESH')
-    }
-    return { x, y }
-  }
-  // auto / screenshot / window are all window-relative: the screenshot IS the
-  // window rect, and coordinates map through the CURRENT rect so a window that
-  // merely moved still receives the same relative click.
-  if (
-    !Number.isInteger(x) || !Number.isInteger(y) ||
-    x < 0 || y < 0 ||
-    x >= window.rect.width || y >= window.rect.height
-  ) {
-    throw new ComputerUseError('COORDINATE_OUT_OF_BOUNDS', `坐标 (${x}, ${y}) 超出窗口范围 ${window.rect.width}x${window.rect.height}`, 'REQUIRES_REFRESH')
-  }
-  return { x: window.rect.left + x, y: window.rect.top + y }
+export function point(window: DesktopWindow, x: number, y: number, _observation?: Observation, coordinateSpace: CoordinateSpace = 'auto'): { x: number; y: number } {
+  return pointCore(window.rect, x, y, coordinateSpace)
 }
 
-function elementPoint(windowId: number, index: number): { x: number; y: number } {
-  let rect: native.Rect
+async function elementPoint(windowId: number | WindowId, index: number): Promise<{ x: number; y: number }> {
   try {
-    rect = native.elementRect(windowId, index, TREE_MAX_NODES, TREE_MAX_DEPTH)
+    const tree = await ensureProvider().accessibilityTree(normalizeWindowId(windowId))
+    const rect = tree.nodes[index]?.rect
+    if (!rect) throw new Error('missing')
+    return { x: Math.floor((rect.left + rect.right) / 2), y: Math.floor((rect.top + rect.bottom) / 2) }
   } catch {
-    throw new ComputerUseError('ELEMENT_NOT_FOUND', `元素索引 ${index} 已失效，请重新观察`, 'REQUIRES_REFRESH')
+    throw new ComputerUseError('ELEMENT_NOT_FOUND', `Element index ${index} is stale; please re-observe`, 'REQUIRES_REFRESH')
   }
-  return { x: Math.floor((rect.left + rect.right) / 2), y: Math.floor((rect.top + rect.bottom) / 2) }
 }
 
-// ---------- overlay ----------
+function validateElementIndex(index: number): void {
+  validateElementIndexCore(index)
+}
+
+// ---------------------------------------------------------------------------
+// Overlay (one indicator implementation per platform, via the provider)
+// ---------------------------------------------------------------------------
 interface OverlayConfig {
   overlayEnabled: boolean
   overlayIdleMs: number
   overlayText: string
-  /** Deprecated: the native overlay color is fixed to the DSH brand blue; kept only for config compatibility. */
+  /** Deprecated: the native overlay color is fixed to the DSH brand blue. */
   overlayColor: string
 }
 const overlay: {
-  handle: number
   timer: ReturnType<typeof setTimeout> | undefined
   pulseTimer: ReturnType<typeof setInterval> | undefined
   visible: boolean
   config: OverlayConfig
-} = { handle: 0, timer: undefined, pulseTimer: undefined, visible: false, config: { overlayEnabled: false, overlayIdleMs: 10_000, overlayText: 'DSH 正在操作电脑', overlayColor: '#00D9FF' } }
+} = { timer: undefined, pulseTimer: undefined, visible: false, config: { overlayEnabled: false, overlayIdleMs: 10_000, overlayText: 'DSH 正在操作电脑', overlayColor: '#00D9FF' } }
 
 export function configureOverlay(config: OverlayConfig): void {
-  if (overlay.config.overlayEnabled && !config.overlayEnabled) hideOverlayNow()
+  if (overlay.config.overlayEnabled && !config.overlayEnabled) void stopControlIndicator()
   overlay.config = config
 }
 
-function hideOverlayNow(fade = false): void {
+async function hideOverlayNow(fade = false): Promise<void> {
+  void fade
   if (overlay.timer) { clearTimeout(overlay.timer); overlay.timer = undefined }
   if (overlay.pulseTimer) { clearInterval(overlay.pulseTimer); overlay.pulseTimer = undefined }
-  if (overlay.visible && overlay.handle) {
-    try { native.overlayHide(overlay.handle, fade) } catch { /* best effort */ }
+  if (overlay.visible) {
+    try { await ensureGuarded().stopIndicator() } catch { /* best effort */ }
     overlay.visible = false
   }
 }
 
-// Blocks the main thread (needed: a real dwell before the click). The move
-// already animated up to 420ms; the extra pause makes the landing readable.
-function syncSleep(ms: number): void {
-  if (ms <= 0) return
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-}
-
-function syncOverlay(windowId = 0): void {
+async function syncOverlay(windowId: number | WindowId = 0): Promise<void> {
   if (!overlay.config.overlayEnabled) return
-  if (!overlay.handle) {
-    try { overlay.handle = native.overlayCreate() } catch { return }
-  }
   try {
-    if (native.overlayShow(overlay.handle, windowId, overlay.config.overlayText)) {
+    if (!overlay.visible) {
+      await ensureGuarded().startIndicator(windowId ? normalizeWindowId(windowId) : undefined)
       overlay.visible = true
-      if (overlay.timer) clearTimeout(overlay.timer)
-      if (overlay.pulseTimer) clearInterval(overlay.pulseTimer)
-      overlay.pulseTimer = setInterval(refreshOverlay, 100)
-      overlay.timer = setTimeout(() => hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs))
     }
+    if (overlay.timer) clearTimeout(overlay.timer)
+    if (overlay.pulseTimer) clearInterval(overlay.pulseTimer)
+    const pulse = ensureProvider().refreshIndicator
+    if (pulse) overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined) }, 100)
+    overlay.timer = setTimeout(() => void hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs))
   } catch { /* overlay is best effort */ }
 }
 
-// Shows the feedback overlay before a tool even asks for approval, so the
-// user sees "DSH 正在操作电脑" while the approval dialog is on screen.
-export function showOverlay(windowId = 0): void {
-  syncOverlay(windowId)
+/** Shows the feedback overlay before a tool even asks for approval. */
+export function showOverlay(windowId: number | WindowId = 0): Promise<void> {
+  return syncOverlay(windowId)
 }
 
-function refreshOverlay(): void {
-  if (!overlay.visible || !overlay.handle) return
-  try { native.overlayRefresh(overlay.handle) } catch { /* overlay is best effort */ }
-}
+// ---------------------------------------------------------------------------
+// Actions: shared core + guarded provider (single chokepoint)
+// ---------------------------------------------------------------------------
 
-function invokeBackgroundClick(windowId: number, p: { x: number; y: number }, count: number): boolean {
-  // Keep the visual cursor honest even when Windows refuses foreground access.
-  // The native provider only invokes a UIA element at this observed point.
-  if (!native.moveCursor(p.x, p.y)) return false
-  refreshOverlay()
-  // Deliberately NOT hiding here: the UIA invoke happens in the background and
-  // the overlay must keep showing so the user sees DSH is still in control.
-  return native.invokeAtPoint(windowId, p.x, p.y, count)
-}
-
-// ---------- actions ----------
-export function capture(windowId: number, path: string): { path: string; rect: Rect } {
-  assertSafeWindow(windowId, '截图')
+export async function capture(windowId: number | WindowId, path: string): Promise<{ path: string; rect: Rect }> {
+  await assertSafeWindow(windowId, 'capture')
   const wasVisible = overlay.visible
-  hideOverlayNow()
+  await hideOverlayNow(false)
   try {
-    const current = activateNative(windowId)
-    // Capture only the target window rect: full-screen screenshots leak other
-    // windows (and the DSH chat bubble) into the vision model's context.
-    if (!native.captureWindow(windowId, path)) throw new ComputerUseError('NATIVE_CAPTURE_FAILED', '窗口截图失败', 'RETRY')
-    return { path, rect: current.rect }
+    const result = await ensureGuarded().captureWindow(normalizeWindowId(windowId), path)
+    return { path: result.path, rect: result.rect }
   } finally {
-    if (wasVisible) syncOverlay(windowId)
+    if (wasVisible) await syncOverlay(windowId)
   }
 }
-
-export function activate(windowId: number): object {
-  assertSafeWindow(windowId, '激活')
-  const current = activateNative(windowId)
-  syncOverlay(windowId)
-  return { activated: true, windowId, foreground: current.foreground, rect: current.rect }
-}
-
-/*
-function clickForeground(windowId: number, x: number, y: number, button: 'left' | 'middle' | 'right', count: number, observation?: Observation, coordinateSpace: CoordinateSpace = 'auto'): object {
-  const w = assertSafeWindow(windowId, '点击')
-  const p = point(w, x, y, observation, coordinateSpace)
-  if (!['left', 'middle', 'right'].includes(button) || !Number.isFinite(count)) throw new ComputerUseError('INVALID_CLICK', '点击参数无效', 'DENY')
-  activateNative(windowId)
-  syncOverlay(windowId)
-  if (!native.moveCursor(p.x, p.y)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '鼠标移动失败', 'RETRY')
-  refreshOverlay()
-  if (!native.click(button, Math.max(1, Math.min(3, count)))) {
-    throw new ComputerUseError('NATIVE_INPUT_FAILED', '鼠标点击失败', 'RETRY')
-  }
-  return { clicked: true, x, y, screenX: p.x, screenY: p.y, method: 'node-native' }
-}
-*/
 
 export interface ClickOptions {
   elementIndex?: number
   clickMethod?: 'auto' | 'post'
 }
 
-export function click(windowId: number, x: number, y: number, button: 'left' | 'middle' | 'right', count: number, observation?: Observation, coordinateSpace: CoordinateSpace = 'auto', options: ClickOptions = {}): object {
-  const w = assertSafeWindow(windowId, 'click')
-  if (!['left', 'middle', 'right'].includes(button) || !Number.isFinite(count)) {
-    throw new ComputerUseError('INVALID_CLICK', 'Invalid click arguments', 'DENY')
-  }
-  const clicks = Math.max(1, Math.min(3, count))
+export async function click(
+  windowId: number | WindowId,
+  x: number,
+  y: number,
+  button: 'left' | 'middle' | 'right',
+  count: number,
+  observation?: Observation,
+  coordinateSpace: CoordinateSpace = 'auto',
+  options: ClickOptions = {},
+): Promise<object> {
+  const id = normalizeWindowId(windowId)
+  await actionObservation(observation, id, 'click', options.elementIndex !== undefined)
+  await assertSafeWindow(id, 'click')
+  if (!['left', 'middle', 'right'].includes(button)) throw new ComputerUseError('INVALID_CLICK', 'Invalid click arguments', 'DENY')
+  if (!Number.isInteger(count) || count < 1 || count > 3) throw new ComputerUseError('INVALID_CLICK', 'clickCount must be an integer from 1 to 3', 'DENY')
   let px = x
   let py = y
   let space = coordinateSpace
   if (options.elementIndex !== undefined) {
-    const center = elementPoint(windowId, options.elementIndex)
-    try {
-      if (native.elementClick(windowId, options.elementIndex, clicks, TREE_MAX_NODES, TREE_MAX_DEPTH)) {
-        return { clicked: true, elementIndex: options.elementIndex, method: 'uia-element' }
-      }
-    } catch { /* pattern invoke unavailable; fall through to a pixel click */ }
+    validateElementIndex(options.elementIndex)
+    const center = await elementPoint(id, options.elementIndex)
+    await actionObservation(observation, id, 'click', true)
     px = center.x
     py = center.y
     space = 'screen'
   }
-  const p = point(w, px, py, observation, space)
-  if (options.clickMethod === 'post') {
-    if (!native.postClick(windowId, p.x, p.y, button, clicks)) throw new ComputerUseError('NATIVE_INPUT_FAILED', 'PostMessage click failed', 'RETRY')
-    return { clicked: true, x, y, screenX: p.x, screenY: p.y, method: 'post' }
-  }
   try {
-    activateNative(windowId)
+    const result = await runClick(
+      { provider: ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id },
+      { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' },
+    )
+    await showOverlay(id)
+    const details = (result as { details?: Record<string, unknown> }).details
+    return { clicked: true, x, y, screenX: details?.x, screenY: details?.y, method: result.method }
   } catch (error) {
-    if (!(error instanceof ComputerUseError) || error.code !== 'NATIVE_ACTIVATE_FAILED') throw error
-    syncOverlay(windowId)
-    if (button === 'left' && invokeBackgroundClick(windowId, p, clicks)) {
-      return { clicked: true, x, y, screenX: p.x, screenY: p.y, method: 'uia-background-invoke' }
-    }
+    // Even a denied/background fallback keeps the takeover indicator honest.
+    await showOverlay(id).catch(() => undefined)
     throw error
   }
-  syncOverlay(windowId)
-  if (!native.moveCursor(p.x, p.y)) throw new ComputerUseError('NATIVE_INPUT_FAILED', 'Mouse movement failed', 'RETRY')
-  refreshOverlay()
-  syncSleep(150) // dwell on the landing point so the action reads as deliberate
-  if (!native.click(button, clicks)) {
-    if (button === 'left' && invokeBackgroundClick(windowId, p, clicks)) {
-      return { clicked: true, x, y, screenX: p.x, screenY: p.y, method: 'uia-background-invoke' }
-    }
-    throw new ComputerUseError('NATIVE_INPUT_FAILED', 'Mouse click failed', 'RETRY')
-  }
-  return { clicked: true, x, y, screenX: p.x, screenY: p.y, method: 'node-native' }
 }
 
-export function typeText(windowId: number, value: string): object {
-  assertSafeWindow(windowId, '输入')
-  if (value.length > 20_000) throw new ComputerUseError('INPUT_TOO_LARGE', '单次输入最多 20000 个字符', 'DENY')
-  activateNative(windowId)
-  syncOverlay(windowId)
-  // Paste-first: SendInput UNICODE events are silently dropped by controls
-  // that ignore them (e.g. the File Explorer search box), yet SendInput still
-  // reports success. Clipboard paste is accepted by those controls, so it is
-  // the primary path and UNICODE injection is the fallback.
-  const previous = native.getClipboardText()
-  if (native.setClipboardText(value)) {
-    const pasted = native.paste()
-    // The Ctrl+V keystrokes are processed asynchronously; give the target app
-    // time to read the clipboard before restoring the previous content.
-    syncSleep(300)
-    try { native.setClipboardText(previous) } catch { /* best effort restore */ }
-    if (pasted) return { typed: true, chars: value.length, method: 'clipboard-paste' }
-  }
-  // Fallback: direct Unicode injection for apps where clipboard paste fails.
-  if (native.typeText(value)) return { typed: true, chars: value.length, method: 'sendinput-unicode' }
-  throw new ComputerUseError('NATIVE_INPUT_FAILED', '文本输入失败', 'RETRY')
+export async function typeText(windowId: number | WindowId, value: string, observation?: Observation): Promise<object> {
+  const id = normalizeWindowId(windowId)
+  await actionObservation(observation, id, 'type')
+  await assertSafeWindow(id, 'type')
+  if (value.length > 20_000) throw new ComputerUseError('INPUT_TOO_LARGE', 'A single input supports at most 20000 characters', 'DENY')
+  const result = await runTypeText(
+    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` },
+    value,
+  )
+  await showOverlay(id)
+  return { typed: true, chars: value.length, method: result.method }
 }
 
-const keyCodes: Record<string, number> = {
-  enter: 13, return: 13, tab: 9, escape: 27, esc: 27, space: 32,
-  backspace: 8, delete: 46, insert: 45, home: 36, end: 35, pageup: 33, pagedown: 34,
-  up: 38, down: 40, left: 37, right: 39,
-  ctrl: 17, control: 17, shift: 16, alt: 18,
-  control_l: 0xA2, control_r: 0xA3, shift_l: 0xA0, shift_r: 0xA1, alt_l: 0xA4, alt_r: 0xA5,
-  capslock: 20, numlock: 144, scrolllock: 145, printscreen: 44, pause: 19,
-  // Punctuation MUST be explicit: charCodeOf('.')=46 is VK_DELETE, so a
-  // naive ASCII fallback would turn '.' into Delete.
-  '.': 0xBE, ',': 0xBC, '/': 0xBF, '\\': 0xDC, ';': 0xBA, "'": 0xDE,
-  '[': 0xDB, ']': 0xDD, '-': 0xBD, '=': 0xBB, '`': 0xC0,
+// System-level chords that must never be sent even though they do not use the
+// Windows/Meta key. Alt+Tab etc. can escape the controlled session.
+const FORBIDDEN_CHORDS: { mods: string[]; key: string }[] = [
+  { mods: ['alt'], key: 'tab' },
+  { mods: ['alt'], key: 'f4' },
+  { mods: ['alt'], key: 'esc' },
+  { mods: ['alt'], key: 'space' },
+  { mods: ['ctrl'], key: 'esc' },
+  { mods: ['ctrl', 'shift'], key: 'esc' },
+  { mods: ['ctrl', 'alt'], key: 'delete' },
+]
+function isForbiddenChord(mods: string[], main: string): boolean {
+  return FORBIDDEN_CHORDS.some((c) => c.key === main && c.mods.every((m) => mods.includes(m)))
 }
-for (let i = 0; i <= 9; i++) {
-  keyCodes[`kp_${i}`] = 0x60 + i
-  keyCodes[`numpad_${i}`] = 0x60 + i
-}
-keyCodes.numpad_add = 0x6B
-keyCodes.numpad_subtract = 0x6D
-keyCodes.numpad_multiply = 0x6A
-keyCodes.numpad_divide = 0x6F
-keyCodes.numpad_decimal = 0x6E
-for (let i = 1; i <= 24; i++) keyCodes[`f${i}`] = 0x70 + (i - 1)
-
-export function pressKey(windowId: number, value: string): object {
-  assertSafeWindow(windowId, '按键')
+export async function pressKey(windowId: number | WindowId, value: string, observation?: Observation): Promise<object> {
+  const id = normalizeWindowId(windowId)
+  await actionObservation(observation, id, 'press key')
+  await assertSafeWindow(id, 'press key')
+  // Reject meta keys and system chords before anything leaves this process.
   const tokens = value.split('+').map((x) => x.trim().toLowerCase()).filter(Boolean)
   if (!tokens.length || tokens.some((x) => ['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'].includes(x))) {
-    throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta 快捷键不允许使用', 'DENY')
+    throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta shortcuts are not allowed', 'DENY')
   }
   const main = tokens.pop()!
-  const mainCode = keyCodes[main] ?? (main.length === 1 && /[a-z0-9]/i.test(main) ? main.toUpperCase().charCodeAt(0) : undefined)
-  if (mainCode === undefined) throw new ComputerUseError('UNSUPPORTED_KEY', `不支持的按键: ${main}`, 'DENY')
-  const mods = tokens.map((x) => keyCodes[x])
-  if (mods.some((code) => code === undefined)) throw new ComputerUseError('UNSUPPORTED_MODIFIER', '不支持的修饰键', 'DENY')
-  activateNative(windowId)
-  syncOverlay(windowId)
-  const held: number[] = []
-  let mainHeld = false
-  try {
-    for (const code of mods) {
-      if (!native.pressKey(code, true)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '修饰键按下失败', 'RETRY')
-      held.push(code)
-    }
-    if (!native.pressKey(mainCode, true)) {
-      throw new ComputerUseError('NATIVE_INPUT_FAILED', '按键发送失败', 'RETRY')
-    }
-    mainHeld = true
-    if (!native.pressKey(mainCode, false)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '按键释放失败', 'RETRY')
-    mainHeld = false
-  } finally {
-    if (mainHeld) native.pressKey(mainCode, false)
-    for (const code of held.reverse()) native.pressKey(code, false)
-  }
-  return { pressed: true, key: value, modifiers: mods.length }
+  if (isForbiddenChord(tokens, main)) throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY')
+  const result = await runPressKey(
+    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id },
+    value,
+  )
+  await showOverlay(id)
+  return { pressed: true, key: value, modifiers: (result.details as { modifiers?: number } | undefined)?.modifiers ?? 0 }
 }
 
 export interface ScrollOptions { elementIndex?: number }
 
-export function scroll(windowId: number, x: number, y: number, scrollX: number, scrollY: number, observation?: Observation, coordinateSpace: CoordinateSpace = 'auto', options: ScrollOptions = {}): object {
-  const w = assertSafeWindow(windowId, '滚动')
-  if (!Number.isFinite(scrollX) || !Number.isFinite(scrollY)) throw new ComputerUseError('INVALID_SCROLL', '滚动值必须是有限数字', 'DENY')
+export async function scroll(
+  windowId: number | WindowId,
+  x: number,
+  y: number,
+  scrollX: number,
+  scrollY: number,
+  observation?: Observation,
+  coordinateSpace: CoordinateSpace = 'auto',
+  options: ScrollOptions = {},
+): Promise<object> {
+  const id = normalizeWindowId(windowId)
+  await actionObservation(observation, id, 'scroll', options.elementIndex !== undefined)
+  await assertSafeWindow(id, 'scroll')
+  if (!Number.isFinite(scrollX) || !Number.isFinite(scrollY)) throw new ComputerUseError('INVALID_SCROLL', 'Scroll values must be finite numbers', 'DENY')
   const dx = Math.max(-20_000, Math.min(20_000, scrollX))
   const dy = Math.max(-20_000, Math.min(20_000, scrollY))
   let px = x
   let py = y
   let space = coordinateSpace
   if (options.elementIndex !== undefined) {
-    const center = elementPoint(windowId, options.elementIndex)
+    validateElementIndex(options.elementIndex)
+    const center = await elementPoint(id, options.elementIndex)
+    await actionObservation(observation, id, 'scroll', true)
     px = center.x
     py = center.y
     space = 'screen'
   }
-  const p = point(w, px, py, observation, space)
-  if (!dx && !dy) return { scrolled: true, x, y, scrollX: 0, scrollY: 0, method: 'none' }
-  try {
-    activateNative(windowId)
-  } catch (error) {
-    if (!(error instanceof ComputerUseError) || error.code !== 'NATIVE_ACTIVATE_FAILED') throw error
-    syncOverlay(windowId)
-    // Background wheel: WM_MOUSEWHEEL / WM_MOUSEHWHEEL carry a single delta, so
-    // both axes require two posts. Post each non-zero axis independently.
-    const postedX = dx === 0 || native.postWheel(windowId, p.x, p.y, dx, true)
-    const postedY = dy === 0 || native.postWheel(windowId, p.x, p.y, dy, false)
-    if (postedX && postedY) {
-      return { scrolled: true, x, y, scrollX: dx, scrollY: dy, method: 'post-wheel' }
-    }
-    throw error
-  }
-  syncOverlay(windowId)
-  if (!native.moveCursor(p.x, p.y)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '鼠标移动失败', 'RETRY')
-  refreshOverlay()
-  if (!native.scroll(p.x, p.y, dx, dy)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '鼠标滚轮输入失败', 'RETRY')
-  return { scrolled: true, x, y, scrollX: dx, scrollY: dy, method: 'SendInput-wheel' }
+  const result = await runScroll(
+    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id },
+    { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space },
+  )
+  await showOverlay(id)
+  const details = (result as { details?: Record<string, unknown> }).details
+  return { scrolled: true, x, y, scrollX: details?.scrollX ?? dx, scrollY: details?.scrollY ?? dy, method: result.method }
 }
 
 export interface DragOptions {
@@ -480,34 +484,70 @@ export interface DragOptions {
   toElementIndex?: number
 }
 
-export function drag(windowId: number, fromX: number, fromY: number, toX: number, toY: number, observation?: Observation, coordinateSpace: CoordinateSpace = 'auto', options: DragOptions = {}): object {
-  const w = assertSafeWindow(windowId, '拖动')
-  const a = options.fromElementIndex !== undefined ? elementPoint(windowId, options.fromElementIndex) : point(w, fromX, fromY, observation, coordinateSpace)
-  const b = options.toElementIndex !== undefined ? elementPoint(windowId, options.toElementIndex) : point(w, toX, toY, observation, coordinateSpace)
-  activateNative(windowId)
-  syncOverlay(windowId)
-  if (!native.drag(a.x, a.y, b.x, b.y)) throw new ComputerUseError('NATIVE_INPUT_FAILED', '鼠标拖动失败', 'RETRY')
-  refreshOverlay()
-  return { dragged: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, method: 'node-native' }
-}
-
-export function accessibilityTree(windowId: number): { nodes: AccessibilityNode[]; checksum: string; mode: 'full' | 'top-level'; truncated: boolean } {
-  assertSafeWindow(windowId, 'UIA 读取')
-  return native.accessibilityTree(windowId, TREE_MAX_NODES, TREE_MAX_DEPTH)
-}
-
-export function disposeRuntime(): void {
-  observations.clear()
-  hideOverlayNow()
-  if (overlay.handle) {
-    try { native.overlayDestroy(overlay.handle) } catch { /* best effort */ }
-    overlay.handle = 0
+export async function drag(
+  windowId: number | WindowId,
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+  observation?: Observation,
+  coordinateSpace: CoordinateSpace = 'auto',
+  options: DragOptions = {},
+): Promise<object> {
+  const id = normalizeWindowId(windowId)
+  await actionObservation(observation, id, 'drag', options.fromElementIndex !== undefined || options.toElementIndex !== undefined)
+  await assertSafeWindow(id, 'drag')
+  if (options.fromElementIndex !== undefined) validateElementIndex(options.fromElementIndex)
+  if (options.toElementIndex !== undefined) validateElementIndex(options.toElementIndex)
+  const a = options.fromElementIndex !== undefined ? await elementPoint(id, options.fromElementIndex) : point(await getWindow(id), fromX, fromY, observation, coordinateSpace)
+  const b = options.toElementIndex !== undefined ? await elementPoint(id, options.toElementIndex) : point(await getWindow(id), toX, toY, observation, coordinateSpace)
+  if (options.fromElementIndex !== undefined || options.toElementIndex !== undefined) {
+    await actionObservation(observation, id, 'drag', true)
   }
-  // Safety net: if the overlay was force-hidden (or the engine is shutting
-  // down) without a normal hide, make sure the system cursor is the default.
-  try { native.restoreSystemCursors() } catch { /* best effort */ }
+  const result = await runDrag(
+    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id },
+    { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' },
+  )
+  await showOverlay(id)
+  return { dragged: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, method: result.method }
+}
+
+export async function accessibilityTree(windowId: number | WindowId): Promise<{ nodes: AccessibilityNode[]; checksum: string; mode: 'full' | 'top-level' | 'platform'; truncated: boolean }> {
+  await assertSafeWindow(windowId, 'UIA read')
+  void TREE_MAX_NODES
+  void TREE_MAX_DEPTH
+  return ensureProvider().accessibilityTree(normalizeWindowId(windowId))
+}
+
+export async function disposeRuntime(): Promise<void> {
+  __clearObservationsForTest()
+  await hideOverlayNow(false)
+  if (provider) {
+    try { await provider.dispose() } catch { /* best effort */ }
+    provider = null
+    guarded = null
+  }
 }
 
 export function stopControlSession(): void {
-  disposeRuntime()
+  void disposeRuntime()
 }
+
+export async function stopControlIndicator(): Promise<void> {
+  await hideOverlayNow(true)
+}
+
+export async function launchApp(app: unknown, args: readonly unknown[] = []): Promise<object> {
+  const { checkLaunchApp } = await import('./core/app-launch.ts')
+  const { app: safeApp, args: safeArgs } = checkLaunchApp(app, args)
+  const result = await ensureGuarded().launchApp({ app: safeApp, args: safeArgs })
+  await showOverlay()
+  return {
+    launched: result.launched,
+    args: result.args,
+    forcedNewWindow: result.forcedNewWindow ?? false,
+    requiresObservation: true,
+  }
+}
+
+export type { ObservationOwner } from './core/observation.ts'

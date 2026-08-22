@@ -5,6 +5,7 @@
  * exposed to the browser by default, so the bubble must ride its own channel.
  * @module
  */
+import { stopControlSession } from "./runtime.js";
 /** Loopback RPC channel used by the permission bubble. */
 export const COMPUTER_USE_RPC_CHANNEL = '/computer-use';
 function ok(value) {
@@ -36,7 +37,11 @@ export function registerComputerUseRpc(ctx, scope) {
                 case 'allowControl/set': {
                     // 写入授权状态；只有显式 true 才算授权。
                     const value = (payload ?? {});
-                    await scope.update({ allowControl: value.allowed === true });
+                    const allowed = value.allowed === true;
+                    const changed = scope.get().allowControl !== allowed;
+                    await scope.update({ allowControl: allowed });
+                    if (changed)
+                        stopControlSession();
                     return ok({ allowed: scope.get().allowControl === true });
                 }
                 default: {
