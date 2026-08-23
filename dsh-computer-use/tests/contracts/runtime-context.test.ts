@@ -9,7 +9,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runWithCallContext, sessionScopeOf, __activeCallContextForTest, } from '../../lib/runtime.js';
+import { runWithCallContext, sessionScopeOf, __activeCallContextForTest, } from '../../src/runtime.ts';
 
 const callOf = (name: string) => ({
   name,
